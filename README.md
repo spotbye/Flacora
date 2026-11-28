@@ -8,7 +8,9 @@
 [![Windows](https://img.shields.io/badge/Windows-369eff?labelColor=black&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiB2aWV3Qm94PSIwIDAgMjAgMjAiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTIwIDEwLjg3M1YyMEw4LjQ3OSAxOC41MzdsLjAwMS03LjY2NEgyMFptLTEzLjEyIDBsLS4wMDEgNy40NjFMMCAxNy40NjF2LTYuNTg4aDYuODhaTTIwIDkuMjczSDguNDhsLS4wMDEtNy44MUwyMCAwdjkuMjczWk02Ljg3OSAxLjY2NmwuMDAxIDcuNjA3SDBWMi41MzlsNi44NzktLjg3M1oiLz48L3N2Zz4=)](https://github.com/spotbye/Flacora/releases/latest)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?labelColor=black&logo=linux&logoColor=white)](https://github.com/spotbye/Flacora/releases/latest)
 
-![Flacora Library screenshot](assets/screenshot.png)
+## Screenshot
+
+![Flacora](assets/screenshot.png)
 
 #### [Troubleshooting](TROUBLESHOOTING.md)
 
