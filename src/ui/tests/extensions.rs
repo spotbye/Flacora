@@ -420,7 +420,14 @@ fn changing_the_extension_filter_scrolls_to_the_top_immediately() {
 #[test]
 fn extensions_can_be_filtered_by_category_and_rechecked_individually() {
     let mut rt = runtime(fixtures::extension_status);
-    assert!(rt.find("status-detail-odesli").is_some(), "unknown status reason displays inline");
+    assert!(rt.find("status-detail-odesli").is_some(), "unknown status reason displays below header");
+    let ([_, remove_y, _, remove_h], _) = rt.presented("remove-odesli").unwrap();
+    let ([_, detail_y, _, _], _) = rt.presented("status-detail-odesli").unwrap();
+    assert!(
+        detail_y >= remove_y + remove_h - 1.0,
+        "status error text must sit below card actions without overlapping them: detail_y={detail_y}, actions_bottom={}",
+        remove_y + remove_h
+    );
     assert!(rt.find("ext-filter-lyrics").is_some());
     tap(&mut rt, "ext-filter-lyrics");
     assert!(rt.find("ext-betterlyrics").is_some());

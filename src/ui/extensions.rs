@@ -285,21 +285,22 @@ fn extension_card(s: &App, k: &Kit, installed: &Installed) -> El {
                 .children(service_names.iter().map(|service| service_badge(s, k, service))));
         }
     }
-    if let Some((reason, color)) = status_issue(s, k, id) {
-        info = info.child(
-            text(reason)
-                .key(format!("status-detail-{id}"))
-                .font(k.ty.text_xsmall)
-                .color(color)
-                .wrap(),
-        );
-    }
-
     let header = row().key("header").w_full().gap(FLACORA.spacing.media).center_y()
         .child(kind_tile(k, id, kind))
         .child(info)
         .child(card_actions(s, k, installed));
     let mut body = col().w_full().child(header);
+    if let Some((reason, color)) = status_issue(s, k, id) {
+        body = body.child(
+            text(reason)
+                .key(format!("status-detail-{id}"))
+                .w_full()
+                .pt(FLACORA.spacing.inline)
+                .font(k.ty.text_xsmall)
+                .color(color)
+                .wrap(),
+        );
+    }
     if !manifest.options.is_empty() && s.extension_settings.as_deref() == Some(id) {
         let mut options = col().key(format!("extension-options-{id}")).w_full().gap(FLACORA.spacing.inline);
         for option in &manifest.options {

@@ -256,7 +256,8 @@ pub struct Tools {
 
 pub const CAN_DOWNLOAD_FFMPEG: bool = cfg!(any(
     all(windows, target_arch = "x86_64"),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
 ));
 
 const CLOAKBROWSER_EXECUTABLE: &str = if cfg!(windows) {
@@ -290,6 +291,13 @@ fn find_ffmpeg(root: &Path) -> Option<PathBuf> {
     let mut folders: Vec<PathBuf> = std::env::split_paths(&path)
         .filter(|dir| !dir.as_os_str().is_empty())
         .collect();
+    #[cfg(target_os = "macos")]
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let dir = PathBuf::from(extra);
+        if !folders.contains(&dir) {
+            folders.push(dir);
+        }
+    }
     let cache = root.join("ffmpeg");
     if let Ok(entries) = fs::read_dir(&cache) {
         let mut cached: Vec<PathBuf> = entries

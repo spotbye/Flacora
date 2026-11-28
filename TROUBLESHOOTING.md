@@ -21,11 +21,12 @@ chmod +x Flacora-1.0.3-linux-x64.AppImage
 If it does not start, install FUSE (`sudo apt install fuse3`) or run it with
 `--appimage-extract-and-run`.
 
-### CloakBrowser reports “No usable sandbox” on Ubuntu
+### CloakBrowser sandbox on Ubuntu 23.10+
 
-Ubuntu can restrict the user namespaces Chromium needs for its sandbox. An
-administrator can grant this permission to the installed CloakBrowser executable
-with an AppArmor profile.
+Ubuntu 23.10+ restricts the unprivileged user namespaces Chromium uses for its
+sandbox. Flacora's browser-based extensions automatically retry with `--no-sandbox`
+when that restriction is encountered. If you prefer to keep Chromium's user-namespace
+sandbox enabled, an administrator can grant permission with an AppArmor profile:
 
 1. Open **Settings → Data Folder** and find `cloakbrowser/chromium-<version>/chrome`.
 2. Use `sudoedit /etc/apparmor.d/flacora-cloakbrowser` and replace the example path
