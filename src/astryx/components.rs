@@ -315,12 +315,14 @@ impl Sidebar {
         self
     }
     pub fn build(self, k: &Kit) -> El {
+        let header_top = if cfg!(target_os = "macos") {
+            FLACORA.sidebar.header_padding_top_macos
+        } else {
+            FLACORA.sidebar.header_padding
+        };
         self.inner
             .inset(FLACORA.sidebar.inset)
-            .header_padding(
-                FLACORA.sidebar.header_padding,
-                FLACORA.sidebar.header_padding,
-            )
+            .header_padding(header_top, FLACORA.sidebar.header_padding)
             .row_gap(FLACORA.sidebar.row_gap)
             .build(k)
             .w(FLACORA.sidebar.width)
