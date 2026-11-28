@@ -228,9 +228,18 @@ fn hovering_a_toast_pauses_auto_dismiss_until_pointer_leaves() {
     let (x, y) = rt.find("info").unwrap();
     rt.pointer_move(x, y);
     rt.frame(1.0 / 60.0);
-    assert!(rt.state.toast_hovered);
+    assert!(rt.state.info_hovered);
 
     // Waiting well past both lifetimes keeps both toasts alive while hovered.
+    rt.frame(5.0);
+    assert!(rt.find("info").is_some());
+    assert!(rt.find("notice").is_some());
+
+    // Moving straight onto the second toast keeps hover active without clobbering.
+    let (nx, ny) = rt.find("notice").unwrap();
+    rt.pointer_move(nx, ny);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.notice_hovered && !rt.state.info_hovered);
     rt.frame(5.0);
     assert!(rt.find("info").is_some());
     assert!(rt.find("notice").is_some());
@@ -238,7 +247,7 @@ fn hovering_a_toast_pauses_auto_dismiss_until_pointer_leaves() {
     // Leaving resumes the timer and gives at least 1s before dismissal.
     rt.pointer_move(10.0, 10.0);
     rt.frame(1.0 / 60.0);
-    assert!(!rt.state.toast_hovered);
+    assert!(!rt.state.info_hovered && !rt.state.notice_hovered);
     rt.frame(0.5);
     assert!(rt.find("info").is_some());
     rt.frame(3.0);

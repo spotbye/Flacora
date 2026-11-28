@@ -190,10 +190,35 @@ pub fn parse_manifest(json: &str) -> Result<Manifest, String> {
             return Err(format!("extension.json env cannot override {key}"));
         }
     }
+    let mut option_keys = std::collections::BTreeSet::new();
+    for option in &manifest.options {
+        if option.key.trim().is_empty() || !option_keys.insert(option.key.as_str()) {
+            return Err("extension.json options must have unique non-empty keys".into());
+        }
+        if option.choices.is_empty() {
+            return Err(format!("extension.json option {:?} has no choices", option.key));
+        }
+    }
+    for host in &manifest.hosts {
+        if !is_valid_manifest_host(host) {
+            return Err(format!("extension.json contains an invalid host: {host:?}"));
+        }
+    }
     // Ignore retired routes in packages already installed by older builds.
     manifest.hosts.retain(|host| !crate::services::is_excluded_host(host));
     manifest.services.retain(|name| !crate::services::is_excluded_service(name));
     Ok(manifest)
+}
+
+fn is_valid_manifest_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    !trimmed.is_empty()
+        && trimmed == host
+        && trimmed.contains('.')
+        && !trimmed.starts_with('.')
+        && !trimmed.ends_with('.')
+        && !trimmed.contains("..")
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 /// True when `value` is a non-empty relative path made solely of normal components.
@@ -217,11 +242,30 @@ fn is_disallowed_env_key(key: &str) -> bool {
     matches!(
         upper.as_str(),
         "FLACORA_EVENTS"
+            | "FLACORA_HOME"
+            | "FLACORA_MONOCHROME"
+            | "PATH"
+            | "PATHEXT"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
+            | "LD_AUDIT"
+            | "LD_DYNAMIC_WEAK"
             | "DYLD_INSERT_LIBRARIES"
             | "DYLD_LIBRARY_PATH"
             | "DYLD_FRAMEWORK_PATH"
+            | "DYLD_FORCE_FLAT_NAMESPACE"
+            | "PYTHONSTARTUP"
+            | "PYTHONPATH"
+            | "NODE_OPTIONS"
+            | "JAVA_TOOL_OPTIONS"
+            | "BASH_ENV"
+            | "ENV"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
     )
 }
 
@@ -345,7 +389,7 @@ fn https_status_url(value: &str) -> Option<reqwest::Url> {
 pub fn command_env(manifest: &Manifest, fill: &Fill) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> =
         manifest.env.iter().map(|(k, v)| (k.clone(), fill_in(v, fill, None))).collect();
-    if manifest.browser && !manifest.env.contains_key("CLOAKBROWSER_HOME") {
+    if manifest.browser && !manifest.env.keys().any(|k| k.eq_ignore_ascii_case("CLOAKBROWSER_HOME")) {
         env.push(("CLOAKBROWSER_HOME".into(), fill.browser.into()));
     }
     env

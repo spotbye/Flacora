@@ -12,7 +12,7 @@ use std::{
 };
 
 /// Maximum bytes buffered per output line before excess bytes are discarded until newline.
-const MAX_LINE_BYTES: usize = 256 * 1024;
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub enum JobEvent {
@@ -161,22 +161,53 @@ pub fn spawn_into(handle: JobHandle, spec: Spec, send: Arc<dyn Fn(JobEvent) + Se
     }
     let waiter = handle;
     thread::spawn(move || {
-        // The pipes close when the process tree ends (or is killed); then reap the child.
+        // Poll try_wait unlocked so cancel() can acquire the mutex immediately; once the direct
+        // child exits, terminate any orphaned descendants so inherited pipes close promptly.
+        let mut delay_ms = 2u64;
+        let exit = loop {
+            let step = {
+                let Ok(mut state) = waiter.state.lock() else {
+                    break Err("The process state lock was poisoned".into());
+                };
+                match state.child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            state.child = None;
+                            Some(Ok(status.code().unwrap_or(-1)))
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            state.child = None;
+                            Some(Err(e.to_string()))
+                        }
+                    },
+                    None => Some(Err("The process handle was lost".into())),
+                }
+            };
+            if let Some(result) = step {
+                break result;
+            }
+            thread::sleep(std::time::Duration::from_millis(delay_ms));
+            delay_ms = (delay_ms * 2).min(20);
+        };
+        if let Ok(mut state) = waiter.state.lock() {
+            #[cfg(windows)]
+            if let Some(job) = state.job.take() {
+                terminate_job(&job);
+            }
+            #[cfg(unix)]
+            if let Some(pgid) = state.pgid.take() {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{pgid}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
         for reader in readers {
             let _ = reader.join();
         }
-        let child = waiter.state.lock().ok().and_then(|mut s| {
-            #[cfg(windows)]
-            let _ = s.job.take();
-            #[cfg(unix)]
-            let _ = s.pgid.take();
-            s.child.take()
-        });
-        let exit = match child.map(|mut c| c.wait()) {
-            Some(Ok(status)) => Ok(status.code().unwrap_or(-1)),
-            Some(Err(e)) => Err(e.to_string()),
-            None => Err("The process handle was lost".into()),
-        };
         send(JobEvent::Exit(exit));
     });
     Ok(())
@@ -263,16 +294,31 @@ pub fn no_console_window(command: &mut Command) {
 #[cfg(not(windows))]
 pub fn no_console_window(_: &mut Command) {}
 
-const DISALLOWED_OPEN_EXTENSIONS: [&str; 14] = [
-    "exe", "bat", "cmd", "com", "msi", "ps1", "vbs", "js", "jse", "scr", "pif", "lnk", "sh", "desktop",
+const ALLOWED_OPEN_EXTENSIONS: [&str; 22] = [
+    "flac", "m4a", "mp3", "ogg", "wav", "opus", "aac", "alac", "aiff",
+    "lrc", "ttml", "srt", "vtt", "txt", "json",
+    "jpg", "jpeg", "png", "webp",
+    "cue", "log", "pdf",
 ];
 
 pub fn is_safe_open_file(path: &Path) -> bool {
-    !path.extension().is_some_and(|ext| {
-        DISALLOWED_OPEN_EXTENSIONS
+    path.extension().is_some_and(|ext| {
+        ALLOWED_OPEN_EXTENSIONS
             .iter()
-            .any(|bad| ext.eq_ignore_ascii_case(bad))
+            .any(|good| ext.eq_ignore_ascii_case(good))
     })
+}
+
+fn spawn_detached(mut command: Command) -> io::Result<()> {
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    #[cfg(not(unix))]
+    let _ = &mut child;
+    Ok(())
 }
 
 /// Opens a local file or folder with the system's default app.
@@ -282,15 +328,19 @@ pub fn open_path(path: &Path) -> Result<(), String> {
     }
     let canonical = path.canonicalize().map_err(|e| format!("Could not resolve path: {e}"))?;
     if canonical.is_file() && !is_safe_open_file(&canonical) {
-        return Err("Refusing to open an executable file.".into());
+        return Err("Refusing to open an unsupported file type.".into());
+    }
+    #[cfg(target_os = "macos")]
+    if canonical.is_dir()
+        && canonical.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    {
+        return Err("Refusing to open an application bundle.".into());
     }
     let target = strip_win_verbatim(&canonical);
     let program = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    Command::new(program)
-        .arg(&target)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not open {}: {e}", target.display()))
+    let mut command = Command::new(program);
+    command.arg(&target);
+    spawn_detached(command).map_err(|e| format!("Could not open {}: {e}", target.display()))
 }
 
 /// Shows a local file selected in the system file manager.
@@ -304,37 +354,31 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         let display = target.to_string_lossy();
-        if display.contains('"') {
-            return Err("Could not reveal path containing quotes.".into());
+        if display.contains('"') || display.chars().any(char::is_control) {
+            return Err("Could not reveal path containing unsupported characters.".into());
         }
-        Command::new("explorer")
-            .raw_arg(format!("/select,\"{display}\""))
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Could not reveal {}: {e}", target.display()))
+        let cleaned = display.trim_end_matches('\\');
+        let mut command = Command::new("explorer");
+        command.raw_arg(format!("/select,\"{cleaned}\""));
+        spawn_detached(command).map_err(|e| format!("Could not reveal {}: {e}", target.display()))
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
-            .arg("-R")
-            .arg(&target)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Could not reveal {}: {e}", target.display()))
+        let mut command = Command::new("open");
+        command.arg("-R").arg(&target);
+        spawn_detached(command).map_err(|e| format!("Could not reveal {}: {e}", target.display()))
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let parent = target.parent().ok_or_else(|| "File has no parent folder.".to_string())?;
-        Command::new("xdg-open")
-            .arg(parent)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Could not reveal {}: {e}", target.display()))
+        let mut command = Command::new("xdg-open");
+        command.arg(parent);
+        spawn_detached(command).map_err(|e| format!("Could not reveal {}: {e}", target.display()))
     }
 }
 
 /// Strips Windows `\\?\` verbatim prefix before handing a canonical path to Explorer.
-fn strip_win_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn strip_win_verbatim(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let text = path.to_string_lossy();
@@ -433,5 +477,15 @@ mod tests {
             }
         }
         assert!(exited, "cancelled process tree must exit promptly");
+    }
+
+    #[test]
+    fn open_file_allowlist_permits_media_and_blocks_scripts() {
+        for good in ["song.flac", "lyrics.LRC", "meta.json", "cover.webp", "track.m4a", "notes.txt"] {
+            assert!(is_safe_open_file(Path::new(good)), "{good} should be allowed");
+        }
+        for bad in ["bad.exe", "bad.dll", "bad.hta", "bad.py", "bad.jar", "bad.app", "noext"] {
+            assert!(!is_safe_open_file(Path::new(bad)), "{bad} should be rejected");
+        }
     }
 }

@@ -3,6 +3,51 @@ use crate::fixtures;
 use std::path::PathBuf;
 
 #[test]
+fn version_updates_are_informational_and_disappear_after_manual_replacement() {
+    use crate::{app::Msg, extension_updates::{self, CheckState}};
+    let mut rt = runtime(fixtures::extensions_page);
+    let installed_before: Vec<_> = rt.state.installed.iter().map(|i| i.manifest.clone()).collect();
+    let feed = extension_updates::parse(br#"{"schema_version":1,"extensions":{"cyan-dl":{"version":"1.0.3"},"odskyler":{"version":"1.0.2+same"},"unknown":{"version":"9.0.0"}}}"#).unwrap();
+    rt.state.apply(Msg::ExtensionVersionsChecked(Ok(feed)));
+    rt.invalidate();
+    rt.frame(1.0);
+    assert!(rt.find("extension-update-cyan-dl").is_some());
+    assert!(rt.find("extension-update-odskyler").is_none());
+    assert!(rt.elements().iter().any(|el| el.key.as_deref() == Some("extension-update-summary") && el.text.as_deref() == Some("1 update available. Download packages manually.")));
+    assert_eq!(rt.state.installed.iter().map(|i| i.manifest.clone()).collect::<Vec<_>>(), installed_before);
+    assert_eq!(rt.state.importing, 0);
+    tap(&mut rt, "check-extension-updates");
+    assert_eq!(rt.state.extension_update_check, CheckState::Checking);
+    rt.state.apply(Msg::ExtensionVersionsChecked(Err("offline".into())));
+    rt.invalidate();
+    rt.frame(1.0);
+    assert!(rt.find("extension-update-cyan-dl").is_some(), "failed checks keep last known information");
+    assert!(rt.elements().iter().any(|el| el.key.as_deref() == Some("extension-update-summary") && el.text.as_deref().is_some_and(|t| t.contains("Could not check updates"))));
+    let mut replacement = fixtures::installed("cyan-dl");
+    replacement.manifest.version = "1.0.3".into();
+    rt.state.apply(Msg::Imported(PathBuf::from("update.fext"), Ok(Box::new(replacement))));
+    rt.invalidate();
+    rt.frame(1.0);
+    assert!(rt.find("extension-update-cyan-dl").is_none());
+}
+
+#[test]
+fn update_indicators_and_refresh_stay_accessible_at_supported_widths() {
+    for size in [crate::MIN_WINDOW_SIZE, (1280.0, 820.0), (1920.0, 1080.0)] {
+        let mut rt = runtime_at(fixtures::extension_updates_available, size);
+        assert!(rt.find("check-extension-updates").is_some());
+        assert!(rt.find("check-extension-status").is_some());
+        assert!(rt.find("install-extension").is_some());
+        assert!(rt.find("extension-update-cyan-dl").is_some());
+        let ([x, _, width, _], _) = rt.presented("ext-cyan-dl").unwrap();
+        let ([ux, _, uw, _], _) = rt.presented("extension-update-cyan-dl").unwrap();
+        assert!(ux >= x && ux + uw <= x + width);
+        tap(&mut rt, "check-extension-updates");
+        assert!(rt.elements().iter().any(|el| el.key.as_deref() == Some("extension-update-summary") && el.text.as_deref() == Some("Checking extension versions…")));
+    }
+}
+
+#[test]
 fn extensions_lists_local_installs_and_keeps_the_header_actions_visible() {
     let mut empty = runtime(fixtures::extensions_empty);
     assert!(empty.find("drop-zone").is_some());
@@ -404,11 +449,22 @@ fn extensions_opens_rentry_in_both_states() {
     for scene in [fixtures::extensions_empty as fn(&mut App), fixtures::extensions_page] {
         let mut rt = runtime(scene);
         assert!(rt.elements().iter().any(|el| {
-            el.key.as_deref() == Some("download-extensions") && el.text.as_deref() == Some("Get Extension on Rentry")
+            el.key.as_deref() == Some("download-extensions") && el.text.as_deref() == Some("Get Extensions on Rentry")
         }));
         tap(&mut rt, "download-extensions");
         assert_eq!(rt.take_url_requests(), ["https://rentry.org/flacora"]);
     }
+}
+
+#[test]
+fn extension_card_remove_can_be_cancelled_inline_and_exposes_data_folder_button() {
+    let mut rt = runtime(fixtures::extensions_page);
+    assert!(rt.find("data-cyan-dl").is_some());
+    tap(&mut rt, "remove-cyan-dl");
+    assert_eq!(rt.state.confirm_action, Some(crate::app::ConfirmAction::RemoveExtension("cyan-dl".into())));
+    assert!(rt.find("cancel-remove-cyan-dl").is_some());
+    tap(&mut rt, "cancel-remove-cyan-dl");
+    assert!(rt.state.confirm_action.is_none());
 }
 
 #[test]

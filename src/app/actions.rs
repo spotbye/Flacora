@@ -1,6 +1,6 @@
 //! Routing, settings persistence, extension management, and library actions.
 
-use super::{App, LibrarySort, Msg, RESOLVER_KEY, SaveState, UndoAction};
+use super::{App, LibrarySort, LibraryStatusFilter, Msg, RESOLVER_KEY, SaveState, UndoAction};
 use crate::{
     extensions::{self, Kind},
     library::{self, Entry},
@@ -58,7 +58,8 @@ impl App {
     }
 
     /// Installed downloaders that accept links on `host`, best first. A downloader whose status
-    /// check says the link's service is down right now is left out.
+    /// check says the link's service is down right now is left out, and globally offline downloaders
+    /// sort behind healthy or unchecked ones.
     pub fn candidates_for(&self, host: &str) -> Vec<&Installed> {
         let service = services::detect(host);
         let mut found: Vec<&Installed> = self
@@ -66,11 +67,16 @@ impl App {
             .into_iter()
             .filter(|i| !self.removing.contains(&i.manifest.id))
             .filter(|i| match (self.extension_status.get(&i.manifest.id), service) {
-                (Some(ExtensionStatus::Services(live)), Some(service)) => live.iter().any(|s| s == service.name),
+                (Some(ExtensionStatus::Services(live)), Some(service)) => {
+                    live.iter().any(|s| s.eq_ignore_ascii_case(service.name))
+                }
                 _ => true,
             })
             .collect();
-        found.sort_by_key(|i| (extensions::rank(&i.manifest.id), i.manifest.name.to_lowercase()));
+        found.sort_by_key(|i| {
+            let offline = matches!(self.extension_status.get(&i.manifest.id), Some(ExtensionStatus::Offline(_)));
+            (offline, extensions::rank(&i.manifest.id), i.manifest.name.to_lowercase())
+        });
         found
     }
 
@@ -172,6 +178,40 @@ impl App {
         self.save_settings();
     }
 
+    pub fn set_max_concurrent_jobs(&mut self, count: usize) {
+        let clamped = count.clamp(1, 4);
+        if self.settings.max_concurrent_jobs != clamped {
+            self.settings.max_concurrent_jobs = clamped;
+            self.save_settings();
+            self.pump();
+        }
+    }
+
+    pub fn recheck_app_update(&mut self) {
+        if self.checking_app_update || self.link.is_none() {
+            return;
+        }
+        self.checking_app_update = true;
+        self.background(|| Msg::ManualUpdateChecked(crate::updates::check_result()));
+    }
+
+    pub fn clear_cover_cache(&mut self) {
+        let keep: Vec<String> = self
+            .jobs
+            .iter()
+            .filter_map(|j| j.cover.clone())
+            .chain(self.history.iter().filter_map(|e| e.cover.clone()))
+            .collect();
+        self.images.retain(|path, _| keep.contains(path));
+        self.image_order.retain(|path| self.images.contains_key(path));
+        let paths = self.paths.clone();
+        self.background_opt(move || {
+            library::prune_unused_covers(&paths, &keep);
+            None
+        });
+        self.success("Cleaned unused cached cover artwork.");
+    }
+
     pub fn set_theme(&mut self, theme: Theme) {
         self.settings.theme = theme;
         self.save_settings();
@@ -213,10 +253,11 @@ impl App {
     // ------------------------------------------------------------ extensions
 
     pub fn remove(&mut self, id: &str) {
-        if self.link.is_none()
-            || self.importing > 0
-            || self.installed.iter().any(|i| i.manifest.id == id && self.status_command_running(i))
-        {
+        if self.link.is_none() || self.importing > 0 {
+            return;
+        }
+        if self.installed.iter().any(|i| i.manifest.id == id && self.status_command_running(i)) {
+            self.warn("Wait for this extension's status check to finish before removing it.");
             return;
         }
         if self.running_extension(id) {
@@ -342,14 +383,149 @@ impl App {
 
     // ------------------------------------------------------------ library
 
+    pub fn entry_selection_key(entry: &Entry) -> (u64, String) {
+        (entry.date, entry.main_file().unwrap_or(&entry.url).to_owned())
+    }
+
+    pub fn entry_is_missing(&self, entry: &Entry) -> bool {
+        entry
+            .main_file()
+            .and_then(|file| self.library_files.get(file))
+            .is_some_and(|info| !info.exists)
+    }
+
+    pub fn entry_has_lyrics(&self, entry: &Entry) -> bool {
+        entry
+            .main_file()
+            .and_then(|file| self.library_files.get(file))
+            .is_some_and(|info| {
+                info.sidecars
+                    .iter()
+                    .any(|(label, _)| matches!(label.as_str(), "LRC" | "TTML" | "SRT"))
+            })
+    }
+
+    pub fn toggle_library_select_mode(&mut self) {
+        self.library_select_mode = !self.library_select_mode;
+        if !self.library_select_mode {
+            self.library_selected.clear();
+            self.library_batch_lookup_open = false;
+        }
+    }
+
+    pub fn toggle_library_entry_selected(&mut self, index: usize) {
+        let Some(entry) = self.history.get(index) else { return };
+        let key = Self::entry_selection_key(entry);
+        if !self.library_selected.remove(&key) {
+            self.library_selected.insert(key);
+        }
+        if self.library_selected.is_empty() {
+            self.library_batch_lookup_open = false;
+        }
+    }
+
+    pub fn select_visible_library(&mut self) {
+        let keys: Vec<_> = self
+            .filtered_history()
+            .into_iter()
+            .map(|(_, entry)| Self::entry_selection_key(entry))
+            .collect();
+        self.library_selected.extend(keys);
+    }
+
+    pub fn clear_library_selection(&mut self) {
+        self.library_selected.clear();
+        self.library_batch_lookup_open = false;
+    }
+
+    pub fn remove_selected_entries(&mut self) {
+        if self.library_selected.is_empty() {
+            return;
+        }
+        let selected = std::mem::take(&mut self.library_selected);
+        let mut kept = Vec::with_capacity(self.history.len());
+        let mut removed = Vec::new();
+        for entry in self.history.drain(..) {
+            if selected.contains(&Self::entry_selection_key(&entry)) {
+                removed.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.history = kept;
+        self.library_batch_lookup_open = false;
+        if self.history.is_empty() {
+            self.library_select_mode = false;
+        }
+        if !removed.is_empty() {
+            let count = removed.len();
+            self.lookup_picker = None;
+            self.track_inspector = None;
+            self.save_history();
+            self.refresh_library_files();
+            self.success_undo(
+                format!("Removed {count} selected item{}", if count == 1 { "" } else { "s" }),
+                UndoAction::History(removed),
+            );
+        }
+    }
+
+    pub fn export_library(&mut self, tx: &mut Tx) {
+        if self.history.is_empty() {
+            return;
+        }
+        let options = FileDialogOptions {
+            title: "Export Library".into(),
+            directory: Some(self.settings.output.clone()),
+            file_name: Some("flacora-library.csv".into()),
+            ..Default::default()
+        }
+        .filter("CSV Spreadsheet (*.csv)", &["csv"])
+        .filter("JSON (*.json)", &["json"]);
+        tx.save_file(options, |s: &mut App, result, _| match result {
+            Ok(Some(path)) => s.write_library_export(path),
+            Ok(None) => {}
+            Err(error) => s.error(format!("Export dialog: {error}")),
+        });
+    }
+
+    fn write_library_export(&mut self, path: PathBuf) {
+        let entries: Vec<Entry> = if !self.library_selected.is_empty() {
+            self.history
+                .iter()
+                .filter(|entry| self.library_selected.contains(&Self::entry_selection_key(entry)))
+                .cloned()
+                .collect()
+        } else {
+            self.filtered_history()
+                .into_iter()
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        };
+        if self.link.is_some() {
+            self.background(move || {
+                let res = library::export_entries(&path, &entries).map(|count| (path, count));
+                Msg::LibraryExported(res)
+            });
+        } else {
+            let res = library::export_entries(&path, &entries).map(|count| (path, count));
+            self.apply(Msg::LibraryExported(res));
+        }
+    }
+
     pub fn remove_entry(&mut self, index: usize) {
         if index < self.history.len() {
-            let saved = self.history.clone();
-            let title = self.history[index].title.clone();
+            let removed = self.history.remove(index);
+            let title = removed.title.clone();
+            self.library_selected.remove(&Self::entry_selection_key(&removed));
+            if self.library_selected.is_empty() {
+                self.library_batch_lookup_open = false;
+            }
             self.lookup_picker = None;
-            self.history.remove(index);
+            self.track_inspector = None;
             self.save_history();
-            self.success_undo(format!("Removed \"{title}\" from Library"), UndoAction::History(saved));
+            self.refresh_library_files();
+            self.success_undo(format!("Removed \"{title}\" from Library"), UndoAction::History(vec![removed]));
         }
     }
 
@@ -359,13 +535,104 @@ impl App {
         }
         let saved = std::mem::take(&mut self.history);
         let count = saved.len();
+        self.library_select_mode = false;
+        self.library_selected.clear();
+        self.library_batch_lookup_open = false;
         self.lookup_picker = None;
+        self.track_inspector = None;
         self.cover_loading.clear();
         self.save_history();
+        self.refresh_library_files();
         self.success_undo(
             format!("Cleared {count} library item{}", if count == 1 { "" } else { "s" }),
             UndoAction::History(saved),
         );
+    }
+
+    pub fn remove_missing_entries(&mut self) {
+        let mut kept = Vec::with_capacity(self.history.len());
+        let mut removed = Vec::new();
+        for entry in self.history.drain(..) {
+            let missing = entry
+                .main_file()
+                .and_then(|path| self.library_files.get(path))
+                .is_some_and(|info| !info.exists);
+            if missing {
+                self.library_selected.remove(&Self::entry_selection_key(&entry));
+                removed.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.history = kept;
+        if self.library_selected.is_empty() {
+            self.library_batch_lookup_open = false;
+        }
+        if !removed.is_empty() {
+            let count = removed.len();
+            self.lookup_picker = None;
+            self.track_inspector = None;
+            self.save_history();
+            self.refresh_library_files();
+            self.success_undo(
+                format!("Removed {count} missing item{}", if count == 1 { "" } else { "s" }),
+                UndoAction::History(removed),
+            );
+        }
+    }
+
+    pub fn toggle_track_inspector(&mut self, date: u64, file: String) {
+        let target = (date, file.clone());
+        if self.track_inspector.as_ref() == Some(&target) {
+            self.track_inspector = None;
+            return;
+        }
+        self.lookup_picker = None;
+        self.track_inspector = Some(target);
+        if !self.track_specs.contains_key(&file) {
+            if self.link.is_some() {
+                let path = PathBuf::from(&file);
+                self.background(move || Msg::TrackSpecs(file, library::read_track_specs(&path)));
+            } else {
+                let specs = library::read_track_specs(std::path::Path::new(&file));
+                self.track_specs.insert(file, specs);
+            }
+        }
+    }
+
+    pub fn redownload_entry(&mut self, index: usize) {
+        let Some(url) = self.history.get(index).map(|e| e.url.clone()).filter(|u| !u.trim().is_empty()) else {
+            return;
+        };
+        self.url = rune::TextEdit::new(&url);
+        self.batch_destination = None;
+        self.page = super::Page::Downloads;
+        self.enqueue();
+    }
+
+    pub fn open_extension_data(&self, id: &str) {
+        let dir = self.paths.data(id);
+        self.background_opt(move || {
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                return Some(Msg::Error(format!("Could not prepare extension data folder: {error}")));
+            }
+            runner::open_path(&dir).err().map(Msg::Error)
+        });
+    }
+
+    /// URLs of library entries whose main file is not known missing, for O(1) duplicate checks.
+    pub fn library_url_set(&self) -> std::collections::HashSet<&str> {
+        self.history
+            .iter()
+            .filter(|entry| {
+                !entry.url.is_empty()
+                    && entry
+                        .main_file()
+                        .and_then(|f| self.library_files.get(f))
+                        .is_none_or(|info| info.exists)
+            })
+            .map(|entry| entry.url.as_str())
+            .collect()
     }
 
     pub fn save_history(&mut self) {
@@ -385,10 +652,31 @@ impl App {
         })
     }
 
-    /// History entries matching the service filter and search box, sorted by `library_sort`.
+    pub fn active_library_status_filter(&self) -> LibraryStatusFilter {
+        match self.library_status_filter {
+            LibraryStatusFilter::All => LibraryStatusFilter::All,
+            LibraryStatusFilter::Missing => {
+                if self.history.iter().any(|e| self.entry_is_missing(e)) {
+                    LibraryStatusFilter::Missing
+                } else {
+                    LibraryStatusFilter::All
+                }
+            }
+            LibraryStatusFilter::HasLyrics => {
+                if self.history.iter().any(|e| self.entry_has_lyrics(e)) {
+                    LibraryStatusFilter::HasLyrics
+                } else {
+                    LibraryStatusFilter::All
+                }
+            }
+        }
+    }
+
+    /// History entries matching the service filter, status filter, and search box, sorted by `library_sort`.
     pub fn filtered_history(&self) -> Vec<(usize, &Entry)> {
         let query = self.search.text.trim();
         let service_filter = self.active_library_service();
+        let status_filter = self.active_library_status_filter();
         let ascii = query.is_ascii();
         let lower = (!query.is_empty() && !ascii).then(|| query.to_lowercase());
         let mut entries: Vec<(usize, &Entry)> = self
@@ -400,6 +688,12 @@ impl App {
                     && !e.service.eq_ignore_ascii_case(svc)
                 {
                     return false;
+                }
+                match status_filter {
+                    LibraryStatusFilter::All => {}
+                    LibraryStatusFilter::Missing if !self.entry_is_missing(e) => return false,
+                    LibraryStatusFilter::HasLyrics if !self.entry_has_lyrics(e) => return false,
+                    _ => {}
                 }
                 if query.is_empty() {
                     return true;
@@ -421,12 +715,18 @@ impl App {
         entries
     }
 
-    pub fn refresh_library_files(&self) {
-        if self.link.is_none() || self.history.is_empty() {
+    pub fn refresh_library_files(&mut self) {
+        self.library_scan_serial = self.library_scan_serial.wrapping_add(1);
+        if self.history.is_empty() {
+            self.library_files.clear();
             return;
         }
+        if self.link.is_none() {
+            return;
+        }
+        let serial = self.library_scan_serial;
         let paths: Vec<String> = self.history.iter().filter_map(|e| e.main_file().map(str::to_owned)).collect();
-        self.background(move || Msg::LibraryFiles(library::inspect_files(&paths)));
+        self.background(move || Msg::LibraryFiles(serial, library::inspect_files(&paths)));
     }
 
     pub fn open(&self, path: &str) {

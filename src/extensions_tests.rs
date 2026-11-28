@@ -132,8 +132,17 @@ fn manifests_that_escape_their_folder_or_skip_the_url_are_rejected() {
         let escape = MANIFEST.replace("\"odskyler.exe\"", &format!("\"{bad}\""));
         assert!(parse_manifest(&escape).is_err(), "expected rejection for {bad:?}");
     }
-    let bad_env = MANIFEST.replace("\"ODSKYLER_HOME\"", "\"LD_PRELOAD\"");
-    assert!(parse_manifest(&bad_env).is_err());
+    for blocked_env in ["LD_PRELOAD", "PATH", "NODE_OPTIONS", "HTTPS_PROXY", "FLACORA_HOME"] {
+        let bad_env = MANIFEST.replace("\"ODSKYLER_HOME\"", &format!("\"{blocked_env}\""));
+        assert!(parse_manifest(&bad_env).is_err(), "{blocked_env} must be rejected");
+    }
+    let bad_host = MANIFEST.replace("\"tidal.com\"", "\"com\"");
+    assert!(parse_manifest(&bad_host).is_err(), "bare TLD host must be rejected");
+    let empty_choices = MANIFEST.replace(
+        r#"[{"value": "lossless", "label": "Lossless"}, {"value": "hires", "label": "Hi-Res"}]"#,
+        "[]",
+    );
+    assert!(parse_manifest(&empty_choices).is_err(), "empty option choices must be rejected");
     let no_url = MANIFEST.replace("\"{url}\", ", "");
     assert!(parse_manifest(&no_url).is_err());
     assert!(valid_id("Bad Id").is_err());

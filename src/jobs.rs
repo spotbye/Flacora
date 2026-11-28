@@ -64,6 +64,8 @@ pub struct Job {
     pub cover: Option<String>,
     pub log: Vec<String>,
     pub saved: Vec<String>,
+    /// Fallback paths scraped from plain `Saved ...` lines; used only when no structured `saved` event arrived.
+    pub fallback_saved: Vec<String>,
     pub show_log: bool,
     pub handle: Option<JobHandle>,
     pub cancelling: bool,
@@ -112,6 +114,7 @@ impl Job {
             cover: None,
             log: Vec::new(),
             saved: Vec::new(),
+            fallback_saved: Vec::new(),
             show_log: false,
             handle: None,
             cancelling: false,
@@ -145,7 +148,10 @@ pub fn validate_saved_files(
     enforce_containment: bool,
 ) -> Result<Vec<String>, String> {
     let base = if enforce_containment {
-        base_dir.and_then(|dir| dir.canonicalize().ok())
+        let Some(dir) = base_dir.and_then(|dir| dir.canonicalize().ok()) else {
+            return Err("The output folder could not be resolved".into());
+        };
+        Some(dir)
     } else {
         None
     };
@@ -157,7 +163,7 @@ pub fn validate_saved_files(
         }
         let path = std::path::Path::new(trimmed);
         if !runner::is_safe_open_file(path) {
-            return Err("The extension reported an unsupported executable file".into());
+            return Err("The extension reported an unsupported file type".into());
         }
         if let Some(base) = &base {
             let resolved = if path.is_absolute() {
@@ -169,8 +175,10 @@ pub fn validate_saved_files(
             if !resolved.is_file() || !resolved.starts_with(base) {
                 return Err("The extension reported a file outside its output folder".into());
             }
-            let display = resolved.to_string_lossy().into_owned();
-            let cleaned = display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned();
+            if !runner::is_safe_open_file(&resolved) {
+                return Err("The extension reported an unsupported file type".into());
+            }
+            let cleaned = runner::strip_win_verbatim(&resolved).to_string_lossy().into_owned();
             if !validated.contains(&cleaned) {
                 validated.push(cleaned);
             }
@@ -188,9 +196,15 @@ pub fn validate_saved_files(
 fn job_line(job: &mut Job, line: String) -> Option<String> {
     match protocol::parse(&line) {
         Some(Event::Track { title, artist, album, cover }) => {
-            job.title = Some(title).filter(|t| !t.is_empty());
-            job.artist = Some(artist).filter(|a| !a.is_empty());
-            job.album = Some(album).filter(|a| !a.is_empty());
+            if !title.is_empty() {
+                job.title = Some(title);
+            }
+            if !artist.is_empty() {
+                job.artist = Some(artist);
+            }
+            if !album.is_empty() {
+                job.album = Some(album);
+            }
             return cover.filter(|_| job.cover.is_none());
         }
         Some(Event::Quality(text)) => job.quality = Some(text),
@@ -214,9 +228,9 @@ fn job_line(job: &mut Job, line: String) -> Option<String> {
             }) => {}
         None => {
             if let Some(path) = protocol::saved_line(&line)
-                && !job.saved.contains(&path)
+                && !job.fallback_saved.contains(&path)
             {
-                job.saved.push(path);
+                job.fallback_saved.push(path);
             }
             job.log.push(line);
             if job.log.len() > LOG_LIMIT {
@@ -298,22 +312,106 @@ impl App {
             self.warn(message);
             return;
         }
-        let Some(job) = self.lookup_job(&entry, extension) else { return };
+        let Some(job) = self.lookup_job(&entry, extension, true) else { return };
         self.jobs.push(job);
         self.lookup_picker = None;
         self.page = Page::Downloads;
         self.pump();
     }
 
-    fn lookup_job(&mut self, entry: &Entry, extension: Installed) -> Option<Job> {
+    /// Queues a lookup extension for all selected, non-missing Library tracks.
+    pub fn enqueue_batch_lookup(&mut self, extension_id: &str) {
+        if self.wait_for_import() || self.library_selected.is_empty() {
+            return;
+        }
+        let Some(extension) = self.installed.iter().find(|i| i.manifest.id == extension_id && i.manifest.supports_lookup()).cloned() else {
+            return;
+        };
+        if self.removing.contains(extension_id) {
+            return;
+        }
+        if let Some(message) = extension.manifest.tag_writer_update() {
+            self.warn(message);
+            return;
+        }
+        let selected_entries: Vec<Entry> = self
+            .history
+            .iter()
+            .filter(|entry| {
+                self.library_selected.contains(&App::entry_selection_key(entry))
+                    && !self.entry_is_missing(entry)
+            })
+            .cloned()
+            .collect();
+        let mut added = 0usize;
+        for entry in selected_entries {
+            if let Some(job) = self.lookup_job(&entry, extension.clone(), false) {
+                self.jobs.push(job);
+                added += 1;
+            }
+        }
+        self.library_batch_lookup_open = false;
+        self.library_selected.clear();
+        self.library_select_mode = false;
+        if added > 0 {
+            self.success(format!(
+                "Queued {added} track{} for {}",
+                if added == 1 { "" } else { "s" },
+                extension.manifest.name
+            ));
+            self.page = Page::Downloads;
+            self.pump();
+        } else {
+            self.warn("No eligible FLAC tracks were queued.");
+        }
+    }
+
+    /// Quickly queues a single track from Catalog without leaving the Catalog page.
+    pub fn quick_queue_catalog_track(&mut self, url: String, title: String) {
+        if self.wait_for_import() {
+            return;
+        }
+        let Some(host) = extensions::url_host(&url) else {
+            self.warn("Invalid track link.");
+            return;
+        };
+        let Some(extension) = self.selected_for(&host).or_else(|| self.resolver_for(&host)).cloned() else {
+            self.warn(format!("No installed extension handles {host}."));
+            return;
+        };
+        let picks = extension
+            .manifest
+            .options
+            .iter()
+            .map(|o| self.pick_index(&extension.manifest.id, o))
+            .collect();
+        let id = self.next_job;
+        self.next_job += 1;
+        let mut job = Job::queued(id, url, services::detect(&host), extension, picks, &self.settings);
+        let label = if title.trim().is_empty() {
+            "track".to_owned()
+        } else {
+            job.title = Some(title.clone());
+            format!("\"{title}\"")
+        };
+        self.jobs.push(job);
+        self.success(format!("Queued {label} for download"));
+        self.pump();
+    }
+
+    fn lookup_job(&mut self, entry: &Entry, extension: Installed, warn_duplicate: bool) -> Option<Job> {
         let file = entry.flac_file()?;
         let Ok(file) = std::path::absolute(file) else {
-            self.error("Could not resolve the track's file path.");
+            if warn_duplicate {
+                self.error("Could not resolve the track's file path.");
+            }
             return None;
         };
         let id = &extension.manifest.id;
         if self.jobs.iter().any(|j| !j.is_finished() && &j.extension.manifest.id == id && j.lookup_file.as_ref() == Some(&file)) {
-            self.warn("This lookup is already in the queue.");
+            if warn_duplicate {
+                self.warn("This lookup is already in the queue.");
+            }
             return None;
         }
         let picks = extension.manifest.options.iter().map(|o| self.pick_index(id, o)).collect();
@@ -327,95 +425,142 @@ impl App {
         Some(job)
     }
 
-    /// Starts the next queued job when nothing is running.
+    /// Starts queued jobs up to `max_concurrent_jobs`, keeping browser-backed extensions serialized
+    /// against both running browser jobs and active browser status checks.
     pub fn pump(&mut self) {
-        if self.queue_paused || self.link.is_none() || self.jobs.iter().any(Job::is_running) {
+        if self.queue_paused || self.importing > 0 || self.link.is_none() {
             return;
         }
-        let Some(index) = self.jobs.iter().position(|j| j.status == Status::Queued) else { return };
-        let job = &self.jobs[index];
-        let id = &job.extension.manifest.id;
-        if self.removing.contains(id) || !self.installed.iter().any(|i| i.manifest.id == *id) {
-            let name = job.extension.manifest.name.clone();
-            self.jobs[index].status = Status::Failed(format!("Install {name} to run this job."));
-            return self.pump();
-        }
-        let Some(program) = job.extension.executable() else {
-            let name = job.extension.manifest.name.clone();
-            self.jobs[index].status = Status::Failed(format!("{name} has no build for this computer"));
-            return self.pump();
-        };
-        let manifest = job.extension.manifest.clone();
-        let (data, browser) = (self.paths.data(&manifest.id), self.paths.browser());
-        let flacora_home = std::path::absolute(&self.paths.root).unwrap_or_else(|_| self.paths.root.clone());
-        let output_dir = job.output.clone();
-        let layout = job.layout;
-        let url = job.url.clone();
-        let lookup_file = job.lookup_file.clone();
-        let picks = job.picks.clone();
-        let has_monochrome = manifest.kind == Kind::Resolver && !self.candidates_for("tracks.monochrome.st").is_empty();
-        let job_id = job.id;
-        let Some(link) = &self.link else { return };
-        let msg_send = link.sender();
-        let handle = JobHandle::detached();
-        let job = &mut self.jobs[index];
-        job.status = Status::Running;
-        job.stage = Some("Starting".into());
-        job.handle = Some(handle.clone());
-        std::thread::spawn(move || {
-            let staging = if manifest.kind == Kind::Downloader {
-                match layout.staging(&output_dir) {
-                    Ok(staging) => staging,
-                    Err(error) => {
-                        msg_send(Msg::Job(
-                            job_id,
-                            JobEvent::Exit(Err(format!("Could not prepare the download folder: {error}"))),
-                        ));
-                        return;
-                    }
+        let limit = self.settings.max_concurrent_jobs.clamp(1, 4);
+        loop {
+            let running = self.jobs.iter().filter(|j| j.is_running()).count();
+            if running >= limit {
+                return;
+            }
+            let browser_busy = self.jobs.iter().any(|j| j.is_running() && j.extension.manifest.browser)
+                || self.installed.iter().any(|i| {
+                    i.manifest.browser && !i.manifest.status.is_empty() && self.checking.contains_key(&i.manifest.id)
+                });
+            let mut next_index = None;
+            for (index, job) in self.jobs.iter().enumerate() {
+                if job.status != Status::Queued {
+                    continue;
                 }
-            } else {
-                None
+                let id = &job.extension.manifest.id;
+                let live = self.installed.iter().find(|i| i.manifest.id == *id);
+                let needs_browser = live.map_or(job.extension.manifest.browser, |i| i.manifest.browser);
+                if needs_browser && browser_busy {
+                    continue;
+                }
+                next_index = Some(index);
+                break;
+            }
+            let Some(index) = next_index else { return };
+            let id = self.jobs[index].extension.manifest.id.clone();
+            let live = self.installed.iter().find(|i| i.manifest.id == id).cloned();
+            if self.removing.contains(&id) || live.is_none() {
+                let name = self.jobs[index].extension.manifest.name.clone();
+                self.jobs[index].status = Status::Failed(format!("Install {name} to run this job."));
+                continue;
+            }
+            let live = live.unwrap();
+            let Some(program) = live.executable() else {
+                let name = live.manifest.name.clone();
+                self.jobs[index].status = Status::Failed(format!("{name} has no build for this computer"));
+                continue;
             };
-            let output_text = staging
-                .as_ref()
-                .map_or(output_dir.as_path(), |dir| dir.path())
-                .to_string_lossy()
-                .into_owned();
-            if let Some(staging) = staging {
-                msg_send(Msg::JobStaging(job_id, staging));
-            }
-            let (data_text, browser_text) = (
-                data.to_string_lossy().into_owned(),
-                browser.to_string_lossy().into_owned(),
-            );
-            let file_text = lookup_file.as_deref().map(|p| p.to_string_lossy()).unwrap_or_default();
-            let fill = Fill {
-                url: &url,
-                file: &file_text,
-                output: &output_text,
-                data: &data_text,
-                browser: &browser_text,
-            };
-            let mut env = extensions::command_env(&manifest, &fill);
-            if manifest.requires.iter().any(|required| required == "ffmpeg") {
-                env.retain(|(key, _)| !key.eq_ignore_ascii_case("FLACORA_HOME"));
-                env.push(("FLACORA_HOME".into(), flacora_home.to_string_lossy().into_owned()));
-            }
-            if has_monochrome {
-                env.push(("FLACORA_MONOCHROME".into(), "1".into()));
-            }
-            let spec = runner::Spec {
-                program,
-                args: extensions::command_args(&manifest, &fill, &picks),
-                env,
-                cwd: data,
-            };
-            let event_send = Arc::new(move |event| msg_send(Msg::Job(job_id, event)));
-            if let Err(error) = runner::spawn_into(handle, spec, event_send.clone()) {
-                event_send(JobEvent::Exit(Err(error)));
-            }
-        });
+            // Re-align saved option picks with the live installed manifest (in case it updated before retry).
+            let aligned_picks: Vec<usize> = live
+                .manifest
+                .options
+                .iter()
+                .enumerate()
+                .map(|(idx, option)| {
+                    self.jobs[index]
+                        .picks
+                        .get(idx)
+                        .copied()
+                        .filter(|&choice| choice < option.choices.len())
+                        .unwrap_or_else(|| self.pick_index(&live.manifest.id, option))
+                })
+                .collect();
+            self.jobs[index].extension = live;
+            self.jobs[index].picks = aligned_picks;
+
+            let job = &self.jobs[index];
+            let manifest = job.extension.manifest.clone();
+            let (data, browser) = (self.paths.data(&manifest.id), self.paths.browser());
+            let flacora_home = std::path::absolute(&self.paths.root).unwrap_or_else(|_| self.paths.root.clone());
+            let output_dir = job.output.clone();
+            let layout = job.layout;
+            let url = job.url.clone();
+            let lookup_file = job.lookup_file.clone();
+            let picks = job.picks.clone();
+            let has_monochrome = manifest.kind == Kind::Resolver && !self.candidates_for("tracks.monochrome.st").is_empty();
+            let job_id = job.id;
+            let Some(link) = &self.link else { return };
+            let msg_send = link.sender();
+            let handle = JobHandle::detached();
+            let job = &mut self.jobs[index];
+            job.status = Status::Running;
+            job.stage = Some("Starting".into());
+            job.handle = Some(handle.clone());
+            std::thread::spawn(move || {
+                let staging = if manifest.kind == Kind::Downloader {
+                    match layout.staging(&output_dir) {
+                        Ok(staging) => staging,
+                        Err(error) => {
+                            msg_send(Msg::Job(
+                                job_id,
+                                JobEvent::Exit(Err(format!("Could not prepare the download folder: {error}"))),
+                            ));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let output_text = staging
+                    .as_ref()
+                    .map_or(output_dir.as_path(), |dir| dir.path())
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(staging) = staging {
+                    msg_send(Msg::JobStaging(job_id, staging));
+                }
+                let (data_text, browser_text) = (
+                    data.to_string_lossy().into_owned(),
+                    browser.to_string_lossy().into_owned(),
+                );
+                let file_text = lookup_file.as_deref().map(|p| p.to_string_lossy()).unwrap_or_default();
+                let fill = Fill {
+                    url: &url,
+                    file: &file_text,
+                    output: &output_text,
+                    data: &data_text,
+                    browser: &browser_text,
+                };
+                let mut env = extensions::command_env(&manifest, &fill);
+                if manifest.requires.iter().any(|required| required == "ffmpeg") {
+                    env.retain(|(key, _)| !key.eq_ignore_ascii_case("FLACORA_HOME"));
+                    env.push(("FLACORA_HOME".into(), flacora_home.to_string_lossy().into_owned()));
+                }
+                if has_monochrome {
+                    env.retain(|(key, _)| !key.eq_ignore_ascii_case("FLACORA_MONOCHROME"));
+                    env.push(("FLACORA_MONOCHROME".into(), "1".into()));
+                }
+                let spec = runner::Spec {
+                    program,
+                    args: extensions::command_args(&manifest, &fill, &picks),
+                    env,
+                    cwd: data,
+                };
+                let event_send = Arc::new(move |event| msg_send(Msg::Job(job_id, event)));
+                if let Err(error) = runner::spawn_into(handle, spec, event_send.clone()) {
+                    event_send(JobEvent::Exit(Err(error)));
+                }
+            });
+        }
     }
 
     pub fn job_event(&mut self, job_id: u64, event: JobEvent) {
@@ -452,6 +597,11 @@ impl App {
                     Err(e) => Status::Failed(e),
                 };
                 let staging = job.staging.take();
+                if job.saved.is_empty() && !job.fallback_saved.is_empty() {
+                    job.saved = std::mem::take(&mut job.fallback_saved);
+                } else {
+                    job.fallback_saved.clear();
+                }
                 let enforce_containment = self.link.is_some();
                 if job.status == Status::Done {
                     match (job.extension.manifest.kind, staging) {
@@ -560,6 +710,9 @@ impl App {
 
     pub fn tags_written(&mut self, job_id: u64, result: Result<library::TaggedTrack, String>) {
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id && j.is_running()) else { return };
+        if job.cancelling {
+            return self.job_validated(job_id, Ok(Vec::new()));
+        }
         let track = match result {
             Ok(track) => track,
             Err(error) => return self.job_validated(job_id, Err(error)),
@@ -750,14 +903,21 @@ impl App {
         let auto_tag = job.auto_tag;
         if auto_tag
             && let Some(tagger) = self.tag_writer_for(&entry.url).cloned()
-            && let Some(tag_job) = self.lookup_job(&entry, tagger)
+            && let Some(tag_job) = self.lookup_job(&entry, tagger, false)
         {
             let next = self.jobs.iter().position(|job| job.status == Status::Queued).unwrap_or(self.jobs.len());
             self.jobs.insert(next, tag_job);
         }
         self.history.insert(0, entry);
+        let evicted = self.history.len() > library::LIMIT;
+        if evicted {
+            self.history.truncate(library::LIMIT);
+        }
         self.save_history();
         self.refresh_library_files();
+        if evicted {
+            self.prune_unused_covers();
+        }
         // Extensions whose server tags the file may not report artwork; read it from the file.
         if let (true, Some(flac)) = (needs_cover, flac) {
             let paths = self.paths.clone();
@@ -820,13 +980,42 @@ impl App {
             return;
         }
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id && j.is_finished()) else { return };
-        job.status = Status::Queued;
-        job.cancelling = false;
-        job.log.clear();
-        job.saved.clear();
-        job.progress = None;
-        job.stage = None;
-        job.finished = None;
+        reset_job_for_retry(job);
+        self.pump();
+    }
+
+    pub fn move_job_to_top(&mut self, job_id: u64) {
+        let Some(pos) = self.jobs.iter().position(|j| j.id == job_id && j.status == Status::Queued) else { return };
+        let first_queued = self.jobs.iter().position(|j| j.status == Status::Queued).unwrap_or(pos);
+        if pos > first_queued {
+            let job = self.jobs.remove(pos);
+            self.jobs.insert(first_queued, job);
+        }
+    }
+
+    pub fn choose_all_with_service(&mut self, service: &'static Service) {
+        if self.wait_for_import() {
+            return;
+        }
+        let targets: Vec<(u64, usize)> = self
+            .jobs
+            .iter()
+            .filter(|j| j.status == Status::Choosing)
+            .filter_map(|j| {
+                j.choices
+                    .iter()
+                    .position(|c| c.service == service)
+                    .map(|idx| (j.id, idx))
+            })
+            .collect();
+        for (job_id, choice_idx) in targets {
+            let Some(index) = self.jobs.iter().position(|j| j.id == job_id && j.status == Status::Choosing) else { continue };
+            let Some(picked) = self.jobs[index].choices.get(choice_idx).cloned() else { continue };
+            let Some(downloader) = self.installed.iter().find(|i| {
+                i.manifest.id == picked.downloader && !self.removing.contains(&i.manifest.id)
+            }).cloned() else { continue };
+            self.queue_resolved_job(index, picked.service, picked.url, downloader);
+        }
         self.pump();
     }
 
@@ -873,13 +1062,7 @@ impl App {
         let mut retried = false;
         for job in &mut self.jobs {
             if matches!(job.status, Status::Failed(_) | Status::Cancelled) {
-                job.status = Status::Queued;
-                job.cancelling = false;
-                job.log.clear();
-                job.saved.clear();
-                job.progress = None;
-                job.stage = None;
-                job.finished = None;
+                reset_job_for_retry(job);
                 retried = true;
             }
         }
@@ -911,5 +1094,26 @@ impl App {
 
     pub fn active_jobs(&self) -> usize {
         self.jobs.iter().filter(|j| matches!(j.status, Status::Queued | Status::Running | Status::Choosing)).count()
+    }
+}
+
+fn reset_job_for_retry(job: &mut Job) {
+    job.status = Status::Queued;
+    job.cancelling = false;
+    job.log.clear();
+    job.saved.clear();
+    job.fallback_saved.clear();
+    job.links.clear();
+    job.choices.clear();
+    job.staging = None;
+    job.progress = None;
+    job.stage = None;
+    job.finished = None;
+    job.quality = None;
+    if job.lookup_file.is_none() {
+        job.title = None;
+        job.artist = None;
+        job.album = None;
+        job.cover = None;
     }
 }

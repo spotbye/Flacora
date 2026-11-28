@@ -67,6 +67,41 @@ impl Paths {
     pub fn covers(&self) -> PathBuf {
         self.root.join("covers")
     }
+
+    fn lock_file(&self) -> PathBuf {
+        self.root.join(".flacora.lock")
+    }
+}
+
+/// Runs a filesystem mutation under an advisory file lock so concurrent instances do not race.
+pub fn with_lock<T>(paths: &Paths, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(paths.lock_file())
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let result = work();
+    let _ = lock.unlock();
+    result
+}
+
+/// Removes leftover staging or backup folders from interrupted extension installs.
+pub fn cleanup_stale_temps(paths: &Paths) {
+    let Ok(entries) = fs::read_dir(paths.extensions()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if text.starts_with(".import-") || text.starts_with(".superseded-") || text.ends_with(".old") {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -110,53 +145,14 @@ impl Theme {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ThemePreset {
-    #[default]
-    Neutral,
-    Butter,
-    Chocolate,
-    Gothic,
-    Matcha,
-    Stone,
-    Y2k,
-}
-
-impl ThemePreset {
-    pub const ALL: [Self; 7] = [
-        Self::Neutral, Self::Butter, Self::Chocolate, Self::Gothic, Self::Matcha, Self::Stone, Self::Y2k,
-    ];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Neutral => "neutral",
-            Self::Butter => "butter",
-            Self::Chocolate => "chocolate",
-            Self::Gothic => "gothic",
-            Self::Matcha => "matcha",
-            Self::Stone => "stone",
-            Self::Y2k => "y2k",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Neutral => "Neutral",
-            Self::Butter => "Butter",
-            Self::Chocolate => "Chocolate",
-            Self::Gothic => "Gothic",
-            Self::Matcha => "Matcha",
-            Self::Stone => "Stone",
-            Self::Y2k => "Y2K",
-        }
-    }
-}
+pub use crate::astryx::ThemePreset;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub output: PathBuf,
     pub layout: crate::output::Layout,
     pub auto_tag: bool,
+    pub max_concurrent_jobs: usize,
     pub theme: Theme,
     pub theme_preset: ThemePreset,
     /// Extension id to use per service key, when several are installed.
@@ -168,7 +164,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            output: default_output(), layout: crate::output::Layout::default(), auto_tag: false, theme: Theme::System,
+            output: default_output(), layout: crate::output::Layout::default(), auto_tag: false,
+            max_concurrent_jobs: 1, theme: Theme::System,
             theme_preset: ThemePreset::default(), preferred: BTreeMap::new(), options: BTreeMap::new(),
         }
     }
@@ -196,9 +193,18 @@ pub fn load_settings(paths: &Paths) -> Settings {
             .unwrap_or_default()
     };
     Settings {
-        output: json["output"].as_str().map(PathBuf::from).unwrap_or_else(default_output),
+        output: json["output"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_output),
         layout: serde_json::from_value(json["layout"].clone()).unwrap_or_default(),
         auto_tag: json["auto_tag"].as_bool().unwrap_or_default(),
+        max_concurrent_jobs: json["max_concurrent_jobs"]
+            .as_u64()
+            .map(|n| (n as usize).clamp(1, 4))
+            .unwrap_or(1),
         theme: Theme::ALL.into_iter().find(|t| json["theme"].as_str() == Some(t.key())).unwrap_or_default(),
         theme_preset: ThemePreset::ALL.into_iter().find(|t| json["theme_preset"].as_str() == Some(t.key())).unwrap_or_default(),
         preferred: map("preferred"),
@@ -207,28 +213,37 @@ pub fn load_settings(paths: &Paths) -> Settings {
 }
 
 pub fn save_settings(paths: &Paths, settings: &Settings) -> Result<(), String> {
-    fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    let json = serde_json::json!({
-        "output": settings.output.to_string_lossy(),
-        "layout": settings.layout,
-        "auto_tag": settings.auto_tag,
-        "theme": settings.theme.key(),
-        "theme_preset": settings.theme_preset.key(),
-        "preferred": settings.preferred,
-        "options": settings.options,
-    });
-    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
-    write_atomic(&paths.settings(), text.as_bytes())
+    with_lock(paths, || {
+        fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
+        let json = serde_json::json!({
+            "output": settings.output.to_string_lossy(),
+            "layout": settings.layout,
+            "auto_tag": settings.auto_tag,
+            "max_concurrent_jobs": settings.max_concurrent_jobs.clamp(1, 4),
+            "theme": settings.theme.key(),
+            "theme_preset": settings.theme_preset.key(),
+            "preferred": settings.preferred,
+            "options": settings.options,
+        });
+        let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+        write_atomic(&paths.settings(), text.as_bytes())
+    })
 }
 
 /// Preserves a corrupt JSON file beside its original path before defaults overwrite it.
 pub fn backup_corrupt(path: &Path) {
     let mut name = path.as_os_str().to_os_string();
     name.push(".corrupt");
-    let backup = PathBuf::from(name);
+    let backup = PathBuf::from(&name);
     if !backup.exists() {
         let _ = fs::copy(path, backup);
+        return;
     }
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    name.push(format!("-{stamp}"));
+    let _ = fs::copy(path, PathBuf::from(name));
 }
 
 /// Helper programs the extensions rely on.
@@ -272,11 +287,26 @@ pub fn tools(paths: &Paths) -> Tools {
 fn find_ffmpeg(root: &Path) -> Option<PathBuf> {
     let names = if cfg!(windows) { ["ffmpeg.exe", "ffprobe.exe"] } else { ["ffmpeg", "ffprobe"] };
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut folders: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
     let cache = root.join("ffmpeg");
-    let folders = [cache.join("ffmpeg-9.0"), cache.join("ffmpeg-9.0.2")];
+    if let Ok(entries) = fs::read_dir(&cache) {
+        let mut cached: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        cached.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        folders.extend(cached);
+    }
+    if let Some(dir) = folders.iter().find(|dir| dir.join(names[0]).is_file() && dir.join(names[1]).is_file()) {
+        return std::path::absolute(dir.join(names[0])).ok();
+    }
     let find = |name: &str| {
-        std::env::split_paths(&path).map(|folder| folder.join(name))
-            .chain(folders.iter().map(|folder| folder.join(name)))
+        folders
+            .iter()
+            .map(|folder| folder.join(name))
             .find(|file| file.is_file())
             .and_then(|file| std::path::absolute(file).ok())
     };
@@ -440,7 +470,13 @@ fn check_services(paths: &Paths, installed: &Installed) -> Result<Vec<String>, S
     let mut services = None;
     let mut reason = None;
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let Ok(event) = events.recv_timeout(remaining) else { break };
+        let event = match events.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(reason.unwrap_or_else(|| format!("{} stopped before reporting its services.", manifest.name)));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+        };
         match event {
             JobEvent::Line(line) => {
                 if let Some(protocol::Event::Services(working)) = protocol::parse(&line) {
@@ -458,16 +494,26 @@ fn check_services(paths: &Paths, installed: &Installed) -> Result<Vec<String>, S
     Err("The extension's status command timed out.".into())
 }
 
+fn version_sort_key(version: &str) -> Vec<u64> {
+    version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect()
+}
+
 fn installed_browser(root: &Path) -> Option<String> {
-    fs::read_dir(root).ok()?.filter_map(Result::ok).find_map(|entry| {
-        let name = entry.file_name();
-        let version = name.to_str()?.strip_prefix("chromium-")?;
-        let dir = entry.path();
-        if version.is_empty() || version.ends_with(".tmp") || !dir.join(CLOAKBROWSER_EXECUTABLE).is_file() {
-            return None;
-        }
-        Some(version.to_owned())
-    })
+    let mut versions: Vec<String> = fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let version = name.to_str()?.strip_prefix("chromium-")?;
+            let dir = entry.path();
+            if version.is_empty() || version.ends_with(".tmp") || !dir.join(CLOAKBROWSER_EXECUTABLE).is_file() {
+                return None;
+            }
+            Some(version.to_owned())
+        })
+        .collect();
+    versions.sort_by(|a, b| version_sort_key(b).cmp(&version_sort_key(a)).then_with(|| b.cmp(a)));
+    versions.into_iter().next()
 }
 
 /// Every extension folder with a valid `extension.json`, sorted by name.
@@ -491,6 +537,10 @@ pub const PACKAGE_EXTENSIONS: [&str; 3] = [PACKAGE, "flacora", "zip"];
 
 /// Installs a dropped package, replacing an older install if it is idle.
 pub fn install_file(paths: &Paths, package: &Path, can_replace: impl Fn(&str) -> bool) -> Result<Installed, String> {
+    with_lock(paths, || install_file_locked(paths, package, can_replace))
+}
+
+fn install_file_locked(paths: &Paths, package: &Path, can_replace: impl Fn(&str) -> bool) -> Result<Installed, String> {
     if !package.is_file() {
         return Err(format!("{} is not a file", package.display()));
     }
@@ -532,6 +582,14 @@ pub fn install_file(paths: &Paths, package: &Path, can_replace: impl Fn(&str) ->
         && staging_exe.canonicalize().is_ok_and(|p| p.starts_with(&staging_root));
     if !valid_exe {
         return Err(format!("The package is missing its executable ({relative})"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(&staging_exe) {
+            let mode = meta.permissions().mode() | 0o700;
+            let _ = fs::set_permissions(&staging_exe, fs::Permissions::from_mode(mode));
+        }
     }
     let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let archived = if let Some(legacy) = alias {
@@ -605,13 +663,13 @@ fn unpack_with_limits(archive: &Path, target: &Path, max_entries: usize, max_byt
         _ => e.to_string(),
     })?;
     if &magic == b"FEXT" {
-        return unpack_zip(Cursor::new(decrypt_package(file)?), target, max_entries, max_bytes);
+        return unpack_zip(Cursor::new(decrypt_package(file, max_bytes)?), target, max_entries, max_bytes);
     }
     file.rewind().map_err(|e| e.to_string())?;
     unpack_zip(file, target, max_entries, max_bytes)
 }
 
-fn decrypt_package(mut file: File) -> Result<Vec<u8>, String> {
+fn decrypt_package(mut file: File, max_bytes: u64) -> Result<Vec<u8>, String> {
     let mut version = [0];
     let mut nonce = [0; 12];
     file.read_exact(&mut version).map_err(|e| format!("Could not read package version: {e}"))?;
@@ -621,7 +679,7 @@ fn decrypt_package(mut file: File) -> Result<Vec<u8>, String> {
     file.read_exact(&mut nonce).map_err(|e| format!("Could not read package nonce: {e}"))?;
     let header_len = (FEXT_HEADER.len() + nonce.len()) as u64;
     let payload_len = file.metadata().map_err(|e| e.to_string())?.len().saturating_sub(header_len);
-    if payload_len > MAX_PACKAGE_BYTES + FEXT_TAG_BYTES {
+    if payload_len > max_bytes.saturating_add(FEXT_TAG_BYTES) {
         return Err("This package exceeds the maximum allowed size".to_owned());
     }
     let mut payload = vec![0; payload_len as usize];
@@ -656,7 +714,10 @@ fn unpack_zip(input: impl Read + Seek, target: &Path, max_entries: usize, max_by
             }
             return Err("This package contains an unsafe path".to_string());
         }
-        if !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        if !relative.components().all(|c| match c {
+            std::path::Component::Normal(part) => is_safe_zip_component(part),
+            _ => false,
+        }) {
             return Err("This package contains an unsafe path".to_string());
         }
         let destination = target.join(&relative);
@@ -681,11 +742,25 @@ fn unpack_zip(input: impl Read + Seek, target: &Path, max_entries: usize, max_by
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(mode & 0o777);
+            let perms = fs::Permissions::from_mode((mode & 0o777) | 0o600);
             fs::set_permissions(&destination, perms).map_err(|e| format!("Unpacking failed: {e}"))?;
         }
     }
     Ok(())
+}
+
+fn is_safe_zip_component(part: &std::ffi::OsStr) -> bool {
+    let Some(text) = part.to_str() else { return false };
+    if text.is_empty() || text.ends_with(['.', ' ']) || text.contains([':', '\0']) || text.chars().any(char::is_control) {
+        return false;
+    }
+    let stem = text.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix)
+                .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        });
+    !reserved
 }
 
 /// Swaps `staging` in for `dir`, keeping the old copy until the new one is in place.

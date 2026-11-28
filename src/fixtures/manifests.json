@@ -2,7 +2,7 @@
   {
     "id": "amazon-web",
     "name": "Amazon Music Web",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "metadata",
     "description": "music.amazon.com",
     "services": [
@@ -33,7 +33,7 @@
   {
     "id": "betterlyrics",
     "name": "Better Lyrics",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "lyrics",
     "description": "betterlyrics.org",
     "services": [
@@ -54,7 +54,7 @@
   {
     "id": "cyan-dl",
     "name": "Cyan",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "cyan-dl.pages.dev",
     "services": [
       "Amazon Music"
@@ -102,7 +102,7 @@
   {
     "id": "deezer-web",
     "name": "Deezer Web",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "metadata",
     "description": "deezer.com",
     "services": [
@@ -130,7 +130,7 @@
   {
     "id": "doubledouble",
     "name": "DoubleDouble",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "doubledouble.top",
     "services": [
       "Amazon Music",
@@ -189,7 +189,7 @@
   {
     "id": "flacdownloader",
     "name": "FlacDownloader",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "flacdownloader.com",
     "services": [
       "Qobuz",
@@ -223,7 +223,7 @@
   {
     "id": "lrc-red",
     "name": "lrc.red",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "lyrics",
     "description": "lrc.red",
     "services": [
@@ -244,7 +244,7 @@
   {
     "id": "lrclib",
     "name": "LRCLIB",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "lyrics",
     "description": "lrclib.net",
     "services": [
@@ -286,7 +286,7 @@
   {
     "id": "lucida",
     "name": "Lucida",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": "lucida.to",
     "services": [
       "Amazon Music",
@@ -324,7 +324,7 @@
   {
     "id": "lyricsplus",
     "name": "LyricsPlus",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "lyrics",
     "description": "lyricsplus.binimum.org",
     "services": [
@@ -366,7 +366,7 @@
   {
     "id": "monochrome",
     "name": "Monochrome",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "downloader",
     "description": "monochrome.st",
     "services": [
@@ -393,7 +393,7 @@
   {
     "id": "musicbrainz",
     "name": "MusicBrainz",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "metadata",
     "description": "musicbrainz.org",
     "services": [
@@ -414,7 +414,7 @@
   {
     "id": "musixmatch",
     "name": "Musixmatch",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "lyrics",
     "description": "musixmatch.com",
     "services": [
@@ -459,7 +459,7 @@
   {
     "id": "odesli",
     "name": "Odesli",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "resolver",
     "description": "odesli.co",
     "services": [
@@ -506,7 +506,7 @@
   {
     "id": "odskyler",
     "name": "Rhythmax",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "tidal.odskyler.com",
     "services": [
       "Tidal"
@@ -573,7 +573,7 @@
   {
     "id": "qobuz-web",
     "name": "Qobuz Web",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "metadata",
     "description": "qobuz.com",
     "services": [
@@ -601,7 +601,7 @@
   {
     "id": "spotify-web",
     "name": "Spotify Web",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "metadata",
     "description": "open.spotify.com",
     "services": [
@@ -632,7 +632,7 @@
   {
     "id": "squigly",
     "name": "Squigly",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "resolver",
     "description": "squigly.link",
     "services": [
@@ -673,7 +673,7 @@
   {
     "id": "tidal-web",
     "name": "Tidal Web",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "kind": "metadata",
     "description": "tidal.com",
     "services": [
@@ -701,7 +701,7 @@
   {
     "id": "apple-web",
     "name": "Apple Music Web",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "metadata",
     "description": "music.apple.com",
     "services": [
@@ -728,7 +728,7 @@
   {
     "id": "ytmusic-web",
     "name": "YouTube Music Web",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "kind": "metadata",
     "description": "music.youtube.com",
     "services": [

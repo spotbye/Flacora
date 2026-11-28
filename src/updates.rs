@@ -22,9 +22,12 @@ struct GitHubRelease {
 }
 
 pub fn check() -> Option<Release> {
-    crate::store::client()
-        .and_then(|client| fetch(&client, LATEST_RELEASE))
-        .unwrap_or_default()
+    check_result().unwrap_or_default()
+}
+
+pub fn check_result() -> Result<Option<Release>, String> {
+    let client = crate::store::client()?;
+    fetch(&client, LATEST_RELEASE)
 }
 
 fn fetch(client: &Client, endpoint: &str) -> Result<Option<Release>, String> {

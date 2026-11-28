@@ -1,10 +1,21 @@
 # Troubleshooting
 
+## macOS
+
+1. Open `Flacora-1.0.3-macos-<arch>.dmg` and drag **Flacora.app** to **Applications**.
+2. Release builds are ad-hoc signed and not notarized. If macOS blocks the first launch (for example, “Apple could not verify” or “is damaged”), clear the quarantine attribute and open Flacora again:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Flacora.app
+```
+
+You can also allow it under **System Settings → Privacy & Security → Open Anyway**.
+
 ## Linux
 
 ```sh
-chmod +x Flacora-1.0.2-linux-x64.AppImage
-./Flacora-1.0.2-linux-x64.AppImage
+chmod +x Flacora-1.0.3-linux-x64.AppImage
+./Flacora-1.0.3-linux-x64.AppImage
 ```
 
 If it does not start, install FUSE (`sudo apt install fuse3`) or run it with

@@ -21,7 +21,7 @@ pub struct SidecarInfo {
 /// Checks whether each audio file exists on disk and discovers sibling sidecar files
 /// (`.lrc`, `.ttml`, `.srt`, `.json`) in one directory scan per unique parent folder.
 pub fn inspect_files(audio_paths: &[String]) -> BTreeMap<String, SidecarInfo> {
-    let mut dir_cache: BTreeMap<PathBuf, Vec<(String, PathBuf)>> = BTreeMap::new();
+    let mut dir_cache: BTreeMap<PathBuf, Vec<(String, &'static str, PathBuf)>> = BTreeMap::new();
     let mut results = BTreeMap::new();
     for raw in audio_paths {
         if results.contains_key(raw) {
@@ -37,36 +37,35 @@ pub fn inspect_files(audio_paths: &[String]) -> BTreeMap<String, SidecarInfo> {
                     .flatten()
                     .flatten()
                     .filter_map(|entry| {
-                        let p = entry.path();
-                        if !p.is_file() {
+                        let name_os = entry.file_name();
+                        let name = name_os.to_str()?;
+                        let label = sidecar_label(Path::new(name))?;
+                        let is_file = entry
+                            .file_type()
+                            .map(|ft| ft.is_file() || (ft.is_symlink() && entry.path().is_file()))
+                            .unwrap_or(false);
+                        if !is_file {
                             return None;
                         }
-                        let name = p.file_name()?.to_str()?.to_owned();
-                        Some((name, p))
+                        Some((name.to_lowercase(), label, entry.path()))
                     })
                     .collect()
             });
             let prefix = format!("{}.", stem.to_lowercase());
             let mut seen_labels = BTreeSet::new();
-            for (name, candidate) in entries {
-                let lower = name.to_lowercase();
-                if !lower.starts_with(&prefix) {
-                    continue;
-                }
-                let ext = candidate.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let label = if ext.eq_ignore_ascii_case("lrc") {
-                    "LRC"
-                } else if ext.eq_ignore_ascii_case("ttml") {
-                    "TTML"
-                } else if ext.eq_ignore_ascii_case("srt") {
-                    "SRT"
-                } else if ext.eq_ignore_ascii_case("json") {
-                    "Meta"
-                } else {
+            for (lower, label, candidate) in entries {
+                let Some(rest) = lower.strip_prefix(&prefix) else {
                     continue;
                 };
-                if seen_labels.insert(label) {
-                    sidecars.push((label.to_owned(), candidate.to_string_lossy().into_owned()));
+                let matches_exact = match *label {
+                    "Meta" => rest == "json" || rest.split_once('.').is_some_and(|(tag, ext)| !tag.is_empty() && !tag.contains('.') && ext == "json"),
+                    _ => !rest.contains('.'),
+                };
+                if !matches_exact {
+                    continue;
+                }
+                if seen_labels.insert(*label) {
+                    sidecars.push(((*label).to_owned(), candidate.to_string_lossy().into_owned()));
                 }
             }
             sidecars.sort_by(|a, b| a.0.cmp(&b.0));
@@ -76,8 +75,92 @@ pub fn inspect_files(audio_paths: &[String]) -> BTreeMap<String, SidecarInfo> {
     results
 }
 
+fn sidecar_label(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("lrc") {
+        Some("LRC")
+    } else if ext.eq_ignore_ascii_case("ttml") {
+        Some("TTML")
+    } else if ext.eq_ignore_ascii_case("srt") {
+        Some("SRT")
+    } else if ext.eq_ignore_ascii_case("json") {
+        Some("Meta")
+    } else {
+        None
+    }
+}
+
+/// Technical audio specs and Vorbis tags read on demand for the Library Inspector.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackSpecs {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sample_rate: Option<u32>,
+    pub bits_per_sample: Option<u8>,
+    pub channels: Option<u8>,
+    pub duration_secs: Option<u64>,
+    pub cover_summary: Option<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+pub fn read_track_specs(path: &Path) -> Option<TrackSpecs> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut specs = TrackSpecs {
+        path: path.to_string_lossy().into_owned(),
+        size_bytes: meta.len(),
+        ..TrackSpecs::default()
+    };
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("flac"))
+        && let Ok(tag) = metaflac::Tag::read_from_path(path)
+    {
+        if let Some(info) = tag.get_streaminfo() {
+            specs.sample_rate = Some(info.sample_rate);
+            specs.bits_per_sample = Some(info.bits_per_sample);
+            specs.channels = Some(info.num_channels);
+            if info.sample_rate > 0 {
+                specs.duration_secs = Some(info.total_samples / u64::from(info.sample_rate));
+            }
+        }
+        if let Some(pic) = tag
+            .pictures()
+            .find(|p| p.picture_type == metaflac::block::PictureType::CoverFront)
+            .or_else(|| tag.pictures().next())
+        {
+            let kb = (pic.data.len() as u64).div_ceil(1024);
+            let dims = if pic.width > 0 && pic.height > 0 {
+                format!("{}x{}, ", pic.width, pic.height)
+            } else {
+                String::new()
+            };
+            specs.cover_summary = Some(format!("{dims}{} ({kb} KB)", pic.mime_type));
+        }
+        for (key, label) in [
+            ("TITLE", "Title"),
+            ("ARTIST", "Artist"),
+            ("ALBUMARTIST", "Album Artist"),
+            ("ALBUM", "Album"),
+            ("DATE", "Date"),
+            ("TRACKNUMBER", "Track"),
+            ("DISCNUMBER", "Disc"),
+            ("GENRE", "Genre"),
+            ("ISRC", "ISRC"),
+        ] {
+            if let Some(values) = tag.get_vorbis(key) {
+                let joined: Vec<&str> = values.map(str::trim).filter(|v| !v.is_empty()).collect();
+                if !joined.is_empty() {
+                    specs.tags.push((label.to_owned(), joined.join(", ")));
+                }
+            }
+        }
+    }
+    Some(specs)
+}
+
 /// History entries kept on disk.
-const LIMIT: usize = 500;
+pub const LIMIT: usize = 500;
 const MAX_COVER: u64 = 10 << 20;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -141,13 +224,66 @@ pub fn load(paths: &Paths) -> Vec<Entry> {
 
 /// Newest first, at most `LIMIT` entries.
 pub fn save(paths: &Paths, entries: &[Entry]) -> Result<(), String> {
-    fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    let kept = &entries[..entries.len().min(LIMIT)];
-    let json = serde_json::to_string_pretty(kept).map_err(|e| e.to_string())?;
-    store::write_atomic(&paths.history(), json.as_bytes())
+    store::with_lock(paths, || {
+        fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
+        let kept = &entries[..entries.len().min(LIMIT)];
+        let json = serde_json::to_string_pretty(kept).map_err(|e| e.to_string())?;
+        store::write_atomic(&paths.history(), json.as_bytes())
+    })
 }
 
-/// Downloads cover art into the cache: HTTPS, JPEG or PNG, at most 10 MB.
+/// Exports library entries to CSV (`.csv`) or pretty JSON (all other extensions).
+pub fn export_entries(path: &Path, entries: &[Entry]) -> Result<usize, String> {
+    let is_csv = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"));
+    let payload = if is_csv {
+        let mut out = String::from("title,artist,album,service,extension,quality,url,file,date\n");
+        for entry in entries {
+            let fields = [
+                entry.title.as_str(),
+                entry.artist.as_str(),
+                entry.album.as_str(),
+                entry.service.as_str(),
+                entry.extension.as_str(),
+                entry.quality.as_str(),
+                entry.url.as_str(),
+                entry.main_file().unwrap_or(""),
+            ];
+            for field in fields {
+                write_csv_field(&mut out, field);
+                out.push(',');
+            }
+            out.push_str(&entry.date.to_string());
+            out.push('\n');
+        }
+        out.into_bytes()
+    } else {
+        serde_json::to_string_pretty(entries)
+            .map_err(|e| e.to_string())?
+            .into_bytes()
+    };
+    store::write_atomic(path, &payload)?;
+    Ok(entries.len())
+}
+
+fn write_csv_field(out: &mut String, field: &str) {
+    let needs_quotes = field.contains([',', '"', '\n', '\r']);
+    if !needs_quotes {
+        out.push_str(field);
+        return;
+    }
+    out.push('"');
+    for ch in field.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+}
+
+/// Downloads cover art into the cache: HTTPS, JPEG, PNG, or WebP, at most 10 MB.
 pub fn cover_from_url(paths: &Paths, url: &str) -> Option<(PathBuf, Vec<u8>)> {
     cache(paths, fetch_image(&store::client().ok()?, url, MAX_COVER)?)
 }
@@ -160,8 +296,7 @@ pub fn fetch_image(client: &reqwest::blocking::Client, url: &str, limit: u64) ->
     let response = client.get(parsed).send().ok()?.error_for_status().ok()?;
     let mut bytes = Vec::new();
     response.take(limit + 1).read_to_end(&mut bytes).ok()?;
-    let webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
-    (bytes.len() as u64 <= limit && (is_image(&bytes) || webp)).then_some(bytes)
+    (bytes.len() as u64 <= limit && is_image(&bytes)).then_some(bytes)
 }
 
 /// The front cover embedded in a FLAC file (any picture when there is no front cover).
@@ -235,18 +370,30 @@ fn cache(paths: &Paths, bytes: Vec<u8>) -> Option<(PathBuf, Vec<u8>)> {
     if !is_image(&bytes) || bytes.len() as u64 > MAX_COVER {
         return None;
     }
-    let extension = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
+    let extension = if bytes.starts_with(b"\x89PNG") {
+        "png"
+    } else if is_webp(&bytes) {
+        "webp"
+    } else {
+        "jpg"
+    };
     let name = format!("{:x}", Sha256::digest(&bytes));
     let path = paths.covers().join(format!("{}.{extension}", &name[..32]));
-    if !path.exists() {
+    if !path.is_file() {
         fs::create_dir_all(paths.covers()).ok()?;
-        store::write_atomic(&path, &bytes).ok()?;
+        if store::write_atomic(&path, &bytes).is_err() && !path.is_file() {
+            return None;
+        }
     }
     Some((path, bytes))
 }
 
+fn is_webp(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
+}
+
 fn is_image(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(b"\x89PNG")
+    bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(b"\x89PNG") || is_webp(bytes)
 }
 
 #[cfg(test)]
@@ -276,10 +423,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let track = dir.path().join("Artist - Song.flac");
         let lrc = dir.path().join("Artist - Song.lrc");
+        let unrelated = dir.path().join("Artist - Song.pt2.lrc");
         let meta = dir.path().join("Artist - Song.musicbrainz.json");
         let missing = dir.path().join("Missing.flac");
         fs::write(&track, b"fLaC").unwrap();
         fs::write(&lrc, b"[00:01.00] hi").unwrap();
+        fs::write(&unrelated, b"[00:02.00] other").unwrap();
         fs::write(&meta, b"{}").unwrap();
 
         let track_s = track.to_string_lossy().into_owned();
@@ -288,7 +437,41 @@ mod tests {
         assert!(info[&track_s].exists);
         let labels: Vec<&str> = info[&track_s].sidecars.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, ["LRC", "Meta"]);
+        assert_eq!(info[&track_s].sidecars[0].1, lrc.to_string_lossy());
         assert!(!info[&missing_s].exists);
         assert!(info[&missing_s].sidecars.is_empty());
+
+        let paths = Paths { root: dir.path().to_path_buf() };
+        let webp = b"RIFF\x10\x00\x00\x00WEBPVP8 ".to_vec();
+        let (cached, _) = cache(&paths, webp.clone()).expect("webp cover caches");
+        assert_eq!(cached.extension().and_then(|e| e.to_str()), Some("webp"));
+        assert_eq!(read_cover(&paths, &cached.to_string_lossy()), Some(webp));
+    }
+
+    #[test]
+    fn export_entries_writes_escaped_csv_and_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![Entry {
+            title: "Song, \"Live\"".into(),
+            artist: "HUNTR/X".into(),
+            album: "OST".into(),
+            service: "Tidal".into(),
+            extension: "Rhythmax".into(),
+            quality: "FLAC 24-bit".into(),
+            url: "https://tidal.com/track/1".into(),
+            files: vec!["C:/Music/Song.flac".into()],
+            cover: None,
+            date: 1_700_000_000,
+        }];
+        let csv_path = dir.path().join("lib.csv");
+        assert_eq!(export_entries(&csv_path, &entries).unwrap(), 1);
+        let csv = fs::read_to_string(&csv_path).unwrap();
+        assert!(csv.starts_with("title,artist,album,service,extension,quality,url,file,date\n"));
+        assert!(csv.contains("\"Song, \"\"Live\"\"\",HUNTR/X,OST,Tidal"));
+
+        let json_path = dir.path().join("lib.json");
+        assert_eq!(export_entries(&json_path, &entries).unwrap(), 1);
+        let parsed: Vec<Entry> = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(parsed, entries);
     }
 }

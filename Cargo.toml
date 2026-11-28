@@ -1,6 +1,10 @@
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+
 [package]
 name = "flacora"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "MIT"
 description = "Flacora: Download tracks in true FLAC from Tidal, Qobuz, Amazon Music & Deezer — no account required."
@@ -8,8 +12,8 @@ description = "Flacora: Download tracks in true FLAC from Tidal, Qobuz, Amazon M
 [dependencies]
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 httpdate = "1.0"
-rune = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666", features = ["tooling", "native-file-dialog"] }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d", features = ["tooling", "native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
 metaflac = "0.2"
 pollster = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip"] }
@@ -32,8 +36,12 @@ winresource = "0.1"
 
 # Rune's own [patch.crates-io] at the same rev: Cargo doesn't inherit a dependency's patches.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+# Retain Rune's patched Naga in Cargo.lock: cargo update -p naga --precise 30.0.1.
+naga = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "a1f39c706320c8dea5d7832fb9ddd39b0a19975d" }

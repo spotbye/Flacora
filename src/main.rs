@@ -8,8 +8,10 @@
 mod app;
 mod catalog;
 mod extensions;
+mod extension_updates;
 mod fixtures;
-mod icons;
+mod astryx;
+use astryx::icons;
 mod jobs;
 mod library;
 mod output;
@@ -27,7 +29,7 @@ mod window;
 use app::App;
 use rune::{AppSpec, Chord, ChordKey, ChordMod};
 
-const MIN_WINDOW_SIZE: (f32, f32) = (1024.0, 600.0);
+const MIN_WINDOW_SIZE: (f32, f32) = ui::MIN_WINDOW_SIZE;
 
 /// Flacora's icon (1024 px PNG): the window and taskbar icon and the sidebar logo.
 pub const LOGO: &[u8] = include_bytes!("../assets/appicon.png");
@@ -61,6 +63,8 @@ pub(crate) fn on_key(s: &mut App, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> boo
     const MOD_5: Chord = Chord::new(ChordKey::Char('5')).with(ChordMod::Primary);
     const MOD_L: Chord = Chord::new(ChordKey::Char('l')).with(ChordMod::Primary);
     const MOD_F: Chord = Chord::new(ChordKey::Char('f')).with(ChordMod::Primary);
+    const MOD_Z: Chord = Chord::new(ChordKey::Char('z')).with(ChordMod::Primary);
+    const ALT_LEFT: Chord = Chord::new(ChordKey::Left).with(ChordMod::Alt);
     const ESC: Chord = Chord::new(ChordKey::Escape);
 
     if MOD_1.matches_tx(ev, tx) {
@@ -93,13 +97,41 @@ pub(crate) fn on_key(s: &mut App, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> boo
         s.dismiss_page_overlays();
         if s.page == Page::Library && !s.history.is_empty() {
             tx.focus_when_shown("search", false);
-        } else {
+        } else if s.catalog_providers().next().is_some() {
             s.page = Page::Catalog;
             tx.focus_when_shown("catalog-input", false);
+        } else if !s.history.is_empty() {
+            s.page = Page::Library;
+            s.refresh_library_files();
+            tx.focus_when_shown("search", false);
+        } else {
+            s.page = Page::Downloads;
+            tx.focus_when_shown("url", false);
         }
+        true
+    } else if MOD_Z.matches_tx(ev, tx)
+        && s.undo.is_some()
+        && !s.url.focused
+        && !s.search.focused
+        && !s.catalog.input.focused
+    {
+        s.undo_last();
+        true
+    } else if ALT_LEFT.matches_tx(ev, tx) && s.page == Page::Catalog && s.catalog.can_go_back() {
+        s.catalog.back();
         true
     } else if ESC.matches_tx(ev, tx) {
         if std::mem::take(&mut s.queue_menu_open) || s.confirm_action.take().is_some() {
+            return true;
+        }
+        if let Some((date, file)) = s.track_inspector.take() {
+            if s.page == Page::Library
+                && let Some(index) = s.history.iter().position(|entry| {
+                    entry.date == date && entry.main_file() == Some(file.as_str())
+                })
+            {
+                tx.focus_when_shown(format!("inspect-entry-{index}"), false);
+            }
             return true;
         }
         if let Some((date, file)) = s.lookup_picker.take() {
@@ -113,6 +145,14 @@ pub(crate) fn on_key(s: &mut App, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> boo
             return true;
         }
         if s.extension_settings.take().is_some() {
+            return true;
+        }
+        if s.page == Page::Library && std::mem::take(&mut s.library_batch_lookup_open) {
+            return true;
+        }
+        if s.page == Page::Library && s.library_select_mode {
+            s.library_select_mode = false;
+            s.library_selected.clear();
             return true;
         }
         if s.page == Page::Catalog && !s.catalog.selected.is_empty() {
@@ -153,6 +193,7 @@ fn main() {
             ("library-sources", fixtures::library_sources),
             ("library-single", fixtures::library_single),
             ("library-overflow", fixtures::library_overflow),
+            ("library-batch", fixtures::library_batch),
             ("lookup-picker", fixtures::lookup_picker),
             ("library-outdated-metadata", fixtures::library_outdated_metadata),
             ("catalog", fixtures::catalog_results),
@@ -170,6 +211,11 @@ fn main() {
             ("extension-badges", fixtures::extension_badges),
             ("extension-status", fixtures::extension_status),
             ("extension-options", fixtures::extension_options),
+            ("extension-updates", fixtures::extension_updates_available),
+            ("extension-updates-light", fixtures::extension_updates_light),
+            ("extension-updates-current", fixtures::extension_updates_current),
+            ("extension-updates-failed", fixtures::extension_updates_failed),
+            ("extension-updates-checking", fixtures::extension_updates_checking),
             ("extensions-empty", fixtures::extensions_empty),
             ("extensions-remove-confirmation", fixtures::extensions_remove_confirmation),
             ("extensions-drop", fixtures::extensions_dropping),

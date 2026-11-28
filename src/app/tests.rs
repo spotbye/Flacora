@@ -298,6 +298,48 @@ fn validate_saved_files_enforces_output_containment_and_blocks_executables() {
     assert_eq!(ok.len(), 1);
     assert!(crate::jobs::validate_saved_files(Some(&output), &[outside.to_string_lossy().into_owned()], true).is_err());
     assert!(crate::jobs::validate_saved_files(Some(&output), &[exe.to_string_lossy().into_owned()], true).is_err());
+    assert!(crate::jobs::validate_saved_files(None, &[track.to_string_lossy().into_owned()], true).is_err());
+    assert!(crate::jobs::validate_saved_files(Some(&dir.path().join("missing-dir")), &[track.to_string_lossy().into_owned()], true).is_err());
+}
+
+#[test]
+fn partial_track_events_do_not_erase_metadata_and_undo_merges_without_clobbering_new_entries() {
+    let mut app = fixtures::app();
+    let id = running(&mut app);
+    app.apply(Msg::Job(id, JobEvent::Line(r#"@flacora {"event":"track","title":"Golden","artist":"HUNTR/X","album":"KPop"}"#.into())));
+    app.apply(Msg::Job(id, JobEvent::Line(r#"@flacora {"event":"track","title":"","artist":"","album":"","cover":"https://example.com/c.jpg"}"#.into())));
+    assert_eq!(app.jobs[0].title.as_deref(), Some("Golden"));
+    assert_eq!(app.jobs[0].artist.as_deref(), Some("HUNTR/X"));
+    assert_eq!(app.jobs[0].album.as_deref(), Some("KPop"));
+
+    let initial_len = app.history.len();
+    app.remove_entry(0);
+    assert_eq!(app.history.len(), initial_len - 1);
+    let new_entry = crate::library::Entry {
+        title: "Newly Downloaded".into(),
+        url: "https://tidal.com/track/999".into(),
+        files: vec!["C:/Music/New.flac".into()],
+        date: crate::jobs::now() + 10,
+        ..Default::default()
+    };
+    app.history.insert(0, new_entry.clone());
+    app.undo_last();
+    assert_eq!(app.history.len(), initial_len + 1);
+    assert!(app.history.iter().any(|e| e.title == "Newly Downloaded"));
+}
+
+#[test]
+fn offline_downloaders_rank_behind_healthy_candidates_and_move_to_top_reorders_queue() {
+    let mut app = fixtures::app();
+    app.extension_status.insert("flacdownloader".into(), ExtensionStatus::Offline("Timeout".into()));
+    let ids: Vec<_> = app.candidates_for("tidal.com").iter().map(|i| i.manifest.id.clone()).collect();
+    assert_eq!(ids, ["odskyler", "flacdownloader"]);
+
+    let j1 = fixtures::job(&mut app, "odskyler", "https://tidal.com/track/1", Status::Queued);
+    let j2 = fixtures::job(&mut app, "odskyler", "https://tidal.com/track/2", Status::Queued);
+    app.move_job_to_top(j2);
+    assert_eq!(app.jobs[0].id, j2);
+    assert_eq!(app.jobs[1].id, j1);
 }
 
 #[test]

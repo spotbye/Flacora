@@ -179,6 +179,7 @@ impl Drop for OwnedProcess {
 struct Pending {
     id: u64,
     request: Request,
+    cursor: Option<String>,
     append: bool,
     process: OwnedProcess,
     result: Option<ResultPage>,
@@ -230,9 +231,10 @@ pub fn is_catalog_url(value: &str) -> bool {
         };
         return matches!(route, None | Some("browse" | "home" | "new" | "search"));
     }
-    let browse_host = ["open.spotify.com", "tidal.com", "deezer.com", "qobuz.com", "music.amazon.com",
-        "music.amazon.co.uk", "music.amazon.de", "music.amazon.co.jp"]
-        .iter().any(|domain| host == *domain || host.strip_suffix(domain).is_some_and(|part| part.ends_with('.')));
+    let browse_host = ["open.spotify.com", "tidal.com", "deezer.com", "qobuz.com"]
+        .into_iter()
+        .chain(crate::services::AMAZON_HOSTS.iter().copied())
+        .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|part| part.ends_with('.')));
     if browse_host && (matches!(url.path().trim_end_matches('/'), "" | "/browse" | "/home")
         || url.path_segments().into_iter().flatten().any(|part| matches!(part, "search" | "user-playlists")))
     {
@@ -250,13 +252,36 @@ impl Catalog {
     pub fn select_provider(&mut self, id: String) {
         self.cancel();
         self.clear_artwork_queue();
+        self.clear_failed_artwork();
         self.provider = Some(id);
         self.result = None;
         self.request = None;
+        self.last_failed = None;
         self.trail.clear();
         self.hidden_home = None;
         self.selected.clear();
         self.error = None;
+    }
+
+    pub fn clear_for_removed(&mut self, id: &str) {
+        if self.active_extension() == Some(id) {
+            self.cancel();
+        }
+        if self.provider.as_deref() == Some(id) {
+            self.clear_artwork_queue();
+            self.clear_failed_artwork();
+            self.provider = None;
+            self.result = None;
+            self.request = None;
+            self.last_failed = None;
+            self.hidden_home = None;
+            self.selected.clear();
+            self.error = None;
+        }
+        self.trail.retain(|(req, _, _)| req.provider != id);
+        if self.last_failed.as_ref().is_some_and(|(req, _)| req.provider == id) {
+            self.last_failed = None;
+        }
     }
 
     pub fn busy(&self) -> bool {
@@ -304,11 +329,13 @@ impl Catalog {
     pub fn back(&mut self) {
         self.cancel();
         self.clear_artwork_queue();
+        self.clear_failed_artwork();
         if let Some((request, result, selected)) = self.trail.pop() {
             self.provider = Some(request.provider.clone());
             self.request = Some(request);
             self.result = Some(result);
             self.selected = selected;
+            self.last_failed = None;
             self.error = None;
         }
     }
@@ -323,6 +350,12 @@ impl Catalog {
         }
     }
 
+    fn clear_failed_artwork(&mut self) {
+        let queued: BTreeSet<&str> = self.artwork_queue.iter().map(String::as_str).collect();
+        self.artwork.retain(|url, img| img.is_some() || queued.contains(url.as_str()));
+        self.artwork_cached.retain(|url| self.artwork.contains_key(url));
+    }
+
     pub fn event(&mut self, id: u64, event: JobEvent) {
         let Some(pending) = self.pending.as_mut().filter(|p| p.id == id) else { return };
         match event {
@@ -332,7 +365,12 @@ impl Catalog {
                     && data["event"] == "catalog"
                     && let Ok(mut page) = serde_json::from_value::<ResultPage>(data["page"].take())
                 {
-                    page.items.retain(|item| !item.title.trim().is_empty() && valid_url(&item.url).is_some());
+                    let mut seen = BTreeSet::new();
+                    page.items.retain(|item| {
+                        !item.title.trim().is_empty()
+                            && valid_url(&item.url).is_some()
+                            && seen.insert(item.url.clone())
+                    });
                     page.items.truncate(250);
                     page.validate_sections();
                     pending.result = Some(page);
@@ -351,7 +389,7 @@ impl Catalog {
                     self.request = Some(pending.request);
                     self.last_failed = None;
                 } else {
-                    self.last_failed = Some((pending.request, None));
+                    self.last_failed = Some((pending.request, pending.cursor));
                     self.error = Some(pending.error.or_else(|| exit.err()).unwrap_or_else(|| "The extension returned no catalog results.".into()));
                 }
             }
@@ -426,6 +464,17 @@ impl App {
                 return;
             }
         };
+        if self.wait_for_import() {
+            return;
+        }
+        let Some(installed) = self.catalog_providers().find(|p| p.manifest.id == provider) else {
+            self.catalog.error = Some("The catalog extension is unavailable.".into());
+            return;
+        };
+        if installed.executable().is_none() {
+            self.catalog.error = Some("The catalog extension has no build for this computer.".into());
+            return;
+        }
         if nested {
             if let (Some(previous), Some(result)) = (self.catalog.request.take(), self.catalog.result.take()) {
                 if self.catalog.trail.len() >= MAX_TRAIL {
@@ -494,9 +543,11 @@ impl App {
         self.catalog.cancel();
         self.catalog.error = None;
         self.catalog.provider = Some(request.provider.clone());
+        let cursor = cursor.filter(|c| !c.is_empty() && !c.chars().any(char::is_control));
         let append = cursor.is_some();
         if !append {
             self.catalog.clear_artwork_queue();
+            self.catalog.clear_failed_artwork();
             self.catalog.result = None;
             self.catalog.hidden_home = None;
             self.catalog.selected.clear();
@@ -507,8 +558,8 @@ impl App {
             Query::Search(query) => vec!["--search".into(), query.clone()],
             Query::Home => vec!["--home".into()],
         };
-        if let Some(cursor) = cursor {
-            args.extend(["--cursor".into(), cursor]);
+        if let Some(cursor_val) = &cursor {
+            args.extend(["--cursor".into(), cursor_val.clone()]);
         }
         let cwd = self.paths.data(&request.provider);
         let browser = self.paths.browser();
@@ -521,6 +572,7 @@ impl App {
         self.catalog.pending = Some(Pending {
             id,
             request,
+            cursor,
             append,
             process: OwnedProcess(process.clone()),
             result: None,
@@ -542,8 +594,8 @@ impl App {
                 return;
             }
             if done_rx.recv_timeout(CATALOG_TIMEOUT).is_err() && !timed.is_cancelled() {
-                timed.cancel();
                 timeout_send(Msg::Catalog(id, JobEvent::Line("Error: The catalog request timed out.".into())));
+                timed.cancel();
             }
         });
     }

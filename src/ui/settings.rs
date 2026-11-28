@@ -1,6 +1,7 @@
 //! Settings: download folder, appearance, default extensions, helpers, storage.
 
-use super::theme::{self, FOCUS_RING_OFFSET, FOCUS_RING_WIDTH, Kit};
+use super::theme::FLACORA;
+use super::theme::Kit;
 use super::widgets::{self, card, section};
 use crate::app::{App, RESOLVER_KEY};
 use crate::extensions::Kind;
@@ -8,8 +9,8 @@ use crate::icons;
 use crate::output::{Filename, Folders, Layout};
 use crate::services::SERVICES;
 use crate::store::{self, Theme, ThemePreset};
-use rune::{Color, Cursor, El, FileDialogOptions, Icon, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, Divider, SegmentedControl};
+use rune::{Color, El, FileDialogOptions, Icon, Tx, col, el, icon, row, text};
+use crate::astryx::{Button, ButtonVariant, ControlSize, Divider, SegmentedControl};
 
 pub fn page(s: &App, k: &Kit, dark: bool) -> El {
     let head = widgets::page_header(k, "Settings", "Where downloads go, how Flacora looks, and which extension handles each service.", vec![]);
@@ -19,7 +20,7 @@ pub fn page(s: &App, k: &Kit, dark: bool) -> El {
     }
     let body = col()
         .key("settings-list")
-        .gap(10.0)
+        .gap(FLACORA.spacing.row)
         .child(section(k, "Downloads", None))
         .child(group(k, "group-downloads", downloads))
         .child(section(k, "Appearance", None))
@@ -35,8 +36,10 @@ pub fn page(s: &App, k: &Kit, dark: bool) -> El {
                 .child(widgets::icon_button(k, "refresh-tools", &icons::REFRESH_CW, "Refresh Helpers", |s: &mut App| s.refresh_tools())),
         )
         .child(group(k, "group-helpers", vec![ffmpeg_row(s, k), browser_row(s, k)]))
+        .child(section(k, "Queue", None))
+        .child(group(k, "group-queue", vec![concurrency_row(s, k)]))
         .child(section(k, "Storage", None))
-        .child(group(k, "group-storage", vec![data_row(s, k), history_row(s, k)]));
+        .child(group(k, "group-storage", vec![data_row(s, k), cover_cache_row(s, k), history_row(s, k)]));
     widgets::page("settings-page").child(head).child(widgets::page_scroll(k, body))
 }
 
@@ -54,7 +57,7 @@ fn group(k: &Kit, key: &str, rows: Vec<El>) -> El {
 
 /// A setting: title and explanation on the left, its control on the right.
 fn setting(k: &Kit, key: &str, title: &str, detail: El, control: El) -> El {
-    let label = col().gap(3.0)
+    let label = col().gap(FLACORA.spacing.text)
         .child(text(title.to_owned()).font(k.ty.ui_medium).color(k.c.text_strong))
         .child(detail);
     setting_row(key, label, control)
@@ -64,12 +67,12 @@ fn setting_row(key: &str, label: El, control: El) -> El {
     row()
         .key(key.to_owned())
         .w_full()
-        .px(4.0)
-        .py(10.0)
-        .gap(16.0)
+        .px(FLACORA.spacing.small)
+        .py(FLACORA.spacing.row)
+        .gap(FLACORA.spacing.section)
         .center_y()
         .flex_wrap()
-        .child(label.w(168.0).grow(1.0).shrink().min_w(168.0))
+        .child(label.w(FLACORA.settings.label_width).grow(1.0).shrink().min_w(FLACORA.settings.label_width))
         .child(control)
 }
 
@@ -90,22 +93,26 @@ fn folder_row(s: &App, k: &Kit) -> El {
                 Err(e) => s.error(format!("Folder picker: {e}")),
             });
         })
-        .build(k)
-        .h(32.0)
+        .action().build(k)
         .key("change-output");
     let open = widgets::icon_button(k, "open-output", &icons::SQUARE_ARROW_UP_RIGHT, "Open Folder", |s: &mut App| s.open_output());
-    let mut controls = row().gap(4.0).center_y().child(change);
+    let mut controls = row().gap(FLACORA.spacing.small).center_y().child(change);
     if s.settings.output != store::default_output() {
         controls = controls.child(widgets::icon_button(k, "reset-output", &icons::ROTATE_CCW, "Reset to Default Folder", |s: &mut App| {
             s.set_output(store::default_output())
         }));
     }
     controls = controls.child(open);
+    let output_text = s.settings.output.to_string_lossy().into_owned();
     setting(
         k,
         "setting-folder",
         "Download Folder",
-        text(s.settings.output.to_string_lossy().into_owned()).font(k.ty.mono).color(k.c.text_muted).truncate(),
+        text(output_text.clone())
+            .font(k.ty.mono)
+            .color(k.c.text_muted)
+            .truncate()
+            .help_when_truncated(output_text),
         controls,
     )
 }
@@ -137,48 +144,54 @@ fn preview_row(s: &App, k: &Kit) -> El {
     row()
         .key("setting-preview")
         .w_full()
-        .px(4.0)
-        .py(8.0)
-        .gap(10.0)
+        .px(FLACORA.spacing.small)
+        .py(FLACORA.spacing.inline)
+        .gap(FLACORA.spacing.row)
         .center_y()
         .child(text("Path Preview").font(k.ty.small_medium).color(k.c.text_muted))
         .child(
             el().grow(1.0)
                 .min_w(0.0)
-                .px(10.0)
-                .py(6.0)
+                .px(FLACORA.spacing.row)
+                .py(FLACORA.spacing.label)
                 .radius(k.radius.xs)
                 .fill(k.c.bg_deep)
-                .border(1.0, k.c.border_base)
-                .child(text(example).key("layout-preview").font(k.ty.mono).color(k.c.text_base).truncate()),
+                .border(FLACORA.border.normal, k.c.border_base)
+                .child(
+                    text(example.clone())
+                        .key("layout-preview")
+                        .font(k.ty.mono)
+                        .color(k.c.text_base)
+                        .truncate()
+                        .help_when_truncated(example),
+                ),
         )
+}
+
+fn concurrency_row(s: &App, k: &Kit) -> El {
+    let labels = ["1", "2", "3", "4"];
+    let current = Some(s.settings.max_concurrent_jobs.clamp(1, 4) - 1);
+    setting(
+        k,
+        "setting-concurrency",
+        "Concurrent Downloads",
+        muted(k, "Run up to this many downloads at once. Browser-backed extensions still run one at a time."),
+        widgets::segmented(
+            k,
+            "concurrent-jobs",
+            SegmentedControl::new(&labels, current)
+                .label("Concurrent Downloads")
+                .on_pick(|s: &mut App, i: usize, _: &mut Tx| s.set_max_concurrent_jobs(i + 1)),
+        ),
+    )
 }
 
 fn auto_tag_row(s: &App, k: &Kit) -> El {
     let label = "Automatically Tag Downloads";
     let on = s.settings.auto_tag;
-    let thumb = if on { 20.0 } else { 16.0 };
-    let inset = (24.0 - thumb) / 2.0;
-    let track = el().key("track").size(40.0, 24.0).radius(12.0)
-        .fill(if on { k.c.bg_accent } else { k.c.border_strong })
-        .child(el().key("thumb").size(thumb, thumb).radius(thumb / 2.0)
-            .absolute(if on { 40.0 - thumb - inset } else { inset }, inset)
-            .fill(k.c.bg_base))
-        .a11y_hidden();
     setting(k, "setting-auto-tag", label,
         muted(k, "Update tags and cover art on new FLACs with a matching Web extension."),
-        row().key("auto-tag")
-            .role("switch")
-            .label(label)
-            .checked(on)
-            .focusable(true)
-            .focus_ring(FOCUS_RING_WIDTH, FOCUS_RING_OFFSET, k.c.border_focus)
-            .cursor(Cursor::Pointer)
-            .radius(k.radius.xs)
-            .min_h(28.0)
-            .center()
-            .on_press(App::toggle_auto_tag)
-            .child(track))
+        crate::astryx::switch(k, "auto-tag", label, on, App::toggle_auto_tag))
 }
 
 fn layout_preview(output: &std::path::Path, layout: Layout) -> String {
@@ -196,37 +209,14 @@ fn layout_preview(output: &std::path::Path, layout: Layout) -> String {
 }
 
 fn theme_preset_row(s: &App, k: &Kit, dark: bool) -> El {
-    let choices = ThemePreset::ALL.into_iter().enumerate().map(|(i, preset)| {
-        let selected = s.settings.theme_preset == preset;
-        let preview = theme::kit(preset, dark);
-        let swatch = el().size(18.0, 18.0).radius(4.0)
-            .fill(preview.c.page)
-            .border(1.0, preview.c.border_strong)
-            .center()
-            .child(el().size(8.0, 8.0).radius(2.0).fill(preview.c.bg_accent));
-        let option = row()
-            .key(format!("theme-preset-{}", preset.key()))
-            .role("radio")
-            .label(preset.label())
-            .checked(selected)
-            .position_in_set(i + 1, ThemePreset::ALL.len())
-            .focusable(true)
-            .focus_selected(selected)
-            .focus_ring(FOCUS_RING_WIDTH, FOCUS_RING_OFFSET, k.c.border_focus)
-            .cursor(Cursor::Pointer)
-            .h(30.0).px(8.0).gap(6.0).center_y()
-            .radius(k.radius.md)
-            .fill(if selected { k.c.layer_04 } else { k.c.bg_base })
-            .border(1.0, if selected { k.c.border_focus } else { k.c.border_base })
-            .on_press(move |s: &mut App| s.set_theme_preset(preset))
-            .child(swatch.a11y_hidden())
-            .child(text(preset.label()).font(k.ty.small_medium).color(k.c.text_strong).a11y_hidden());
-        k.interactive(option)
+    let choices = ThemePreset::ALL.into_iter().map(|preset| {
+        crate::astryx::theme_option(k, &format!("theme-preset-{}", preset.key()), preset, dark,
+            s.settings.theme_preset == preset, move |s: &mut App| s.set_theme_preset(preset))
     });
-    col().key("setting-theme-preset").w_full().px(4.0).py(7.0).gap(6.0)
+    col().key("setting-theme-preset").w_full().px(FLACORA.spacing.small).py(FLACORA.settings.preset_padding_y).gap(FLACORA.spacing.label)
         .child(text("Theme").font(k.ty.ui_medium).color(k.c.text_strong))
         .child(row().key("theme-presets").role("radiogroup").label("Theme")
-            .focus_group().w_full().gap(6.0).flex_wrap().children(choices))
+            .focus_group().w_full().gap(FLACORA.spacing.label).flex_wrap().children(choices))
 }
 
 fn theme_row(s: &App, k: &Kit) -> El {
@@ -245,7 +235,7 @@ fn theme_row(s: &App, k: &Kit) -> El {
         widgets::segmented(k, "theme", SegmentedControl::new(&labels, current)
             .label("Color Mode")
             .on_pick(|s: &mut App, i: usize, _: &mut Tx| s.set_theme(Theme::ALL[i])))
-            .w(248.0),
+            .w(FLACORA.settings.mode_width),
     )
 }
 
@@ -307,63 +297,18 @@ fn default_rows(s: &App, k: &Kit) -> Vec<El> {
 fn default_setting(k: &Kit, key: &str, title: &str, help: impl Into<String>, control: El) -> El {
     let help = help.into();
     let label = row().key(format!("{key}-help")).role("group").label(title.to_owned())
-        .self_start().gap(6.0).center_y().description(help.clone()).help(help).help_side(rune::Side::Right)
+        .self_start().gap(FLACORA.spacing.label).center_y().description(help.clone()).help(help).help_side(rune::Side::Right)
         .child(text(title.to_owned()).font(k.ty.ui_medium).color(k.c.text_strong).a11y_hidden())
-        .child(icon(&icons::CIRCLE_INFO, 14.0).color(k.c.text_muted).a11y_hidden());
+        .child(icon(&icons::CIRCLE_INFO, FLACORA.icons.inline).color(k.c.text_muted).a11y_hidden());
     setting_row(&format!("setting-{key}"), col().child(label), control).justify_end()
 }
 
 /// A segmented radio group with consistent sizing and wrapping for long extension lists.
 fn default_picker(k: &Kit, key: &str, group_label: &str, labels: &[String], current: usize, ids: Vec<String>, pref_key: String) -> El {
-    let seg_k = &k.segmented;
-    let count = labels.len();
-    let mut group = row()
-        .key(key.to_owned())
-        .role("radiogroup")
-        .label(group_label.to_owned())
-        .focus_group()
-        .gap(4.0)
-        .shrink().min_w(0.0)
-        .flex_wrap();
-    for (i, label) in labels.iter().enumerate() {
-        let selected = i == current;
-        let pref_key = pref_key.clone();
+    crate::astryx::wrapping_picker(k, key, group_label, labels, current, move |s: &mut App, i| {
         let chosen = i.checked_sub(1).and_then(|idx| ids.get(idx).cloned());
-        let pill = row()
-            .key(format!("segment{i}"))
-            .role("radio")
-            .label(label.clone())
-            .checked(selected)
-            .position_in_set(i + 1, count)
-            .focusable(true)
-            .focus_selected(selected)
-            .focus_ring(FOCUS_RING_WIDTH, FOCUS_RING_OFFSET, k.c.border_focus)
-            .cursor(Cursor::Pointer)
-            .shrink().min_w(0.0)
-            .h(28.0)
-            .px(10.0)
-            .center()
-            .radius(k.radius.xs)
-            .fill(if selected { k.c.surface_raised_base } else { Color::TRANSPARENT })
-            .hover(if selected { k.c.surface_raised_base } else { k.c.hover })
-            .on_press(move |s: &mut App| s.set_preferred(&pref_key, chosen.clone()))
-            .child(
-                text(label.clone())
-                    .font(k.ty.ui_medium)
-                    .color(if selected { k.c.text_strong } else { seg_k.c.text_muted })
-                    .min_w(0.0).shrink().truncate().help_when_truncated(label.clone())
-                    .a11y_hidden(),
-            );
-        group = group.child(pill);
-    }
-    row().w(520.0).shrink().min_w(0.0).justify_end().child(
-        row().key(format!("{key}-track"))
-            .shrink().min_w(0.0)
-            .padding(4.0)
-            .radius(k.radius.md)
-            .fill(k.c.layer_01)
-            .child(group),
-    )
+        s.set_preferred(&pref_key, chosen);
+    })
 }
 
 fn ffmpeg_row(s: &App, k: &Kit) -> El {
@@ -381,7 +326,7 @@ fn ffmpeg_row(s: &App, k: &Kit) -> El {
 fn browser_row(s: &App, k: &Kit) -> El {
     let (detail, status, glyph, color) = match s.tools.as_ref().map(|t| t.browser.as_ref()) {
         None => ("Checking for CloakBrowser…".into(), "Checking", &icons::CLOCK, k.c.text_muted),
-        Some(Some(version)) => (version.clone(), "Installed", &icons::CIRCLE_CHECK, k.c.text_muted),
+        Some(Some(version)) => (version.clone(), "Installed", &icons::CIRCLE_CHECK, k.c.success.fg),
         Some(None) => (
             "CloakBrowser downloads the first time an extension needs it.".into(),
             "On Demand", &icons::DOWNLOAD, k.c.text_muted,
@@ -391,11 +336,12 @@ fn browser_row(s: &App, k: &Kit) -> El {
 }
 
 fn helper_status(k: &Kit, status: &str, glyph: &'static Icon, color: Color) -> El {
-    row().gap(4.0).center_y().child(icon(glyph, 14.0).color(color)).child(text(status.to_owned()).font(k.ty.small_medium).color(color))
+    row().gap(FLACORA.spacing.small).center_y().child(icon(glyph, FLACORA.icons.inline).color(color)).child(text(status.to_owned()).font(k.ty.small_medium).color(color))
 }
 
 fn data_row(s: &App, k: &Kit) -> El {
     let root = s.paths.root.clone();
+    let root_text = root.to_string_lossy().into_owned();
     let open = widgets::icon_button(k, "open-data", &icons::SQUARE_ARROW_UP_RIGHT, "Open Folder", move |s: &mut App| {
         s.open(&root.to_string_lossy())
     });
@@ -403,8 +349,30 @@ fn data_row(s: &App, k: &Kit) -> El {
         k,
         "setting-data",
         "Data Folder",
-        text(s.paths.root.to_string_lossy().into_owned()).font(k.ty.mono).color(k.c.text_muted).truncate(),
+        text(root_text.clone())
+            .font(k.ty.mono)
+            .color(k.c.text_muted)
+            .truncate()
+            .help_when_truncated(root_text),
         open,
+    )
+}
+
+fn cover_cache_row(_s: &App, k: &Kit) -> El {
+    let clear = widgets::button(
+        k,
+        "clear-cover-cache",
+        "Clean Cache",
+        Some(&icons::TRASH_2),
+        ButtonVariant::Outline,
+        App::clear_cover_cache,
+    );
+    setting(
+        k,
+        "setting-cover-cache",
+        "Cover Art Cache",
+        muted(k, "Remove unused cached album artwork from the data folder."),
+        clear,
     )
 }
 

@@ -34,14 +34,12 @@ pub fn installed(id: &str) -> Installed {
 /// A loaded app with four installed extensions, helpers, and a small library.
 pub fn app() -> App {
     let installed = ["cyan-dl", "flacdownloader", "odesli", "odskyler"].map(installed).into();
-    let mut app = App {
-        paths: Paths { root: PathBuf::from("C:/Users/you/AppData/Local/Flacora") },
-        loaded: true,
-        installed,
-        tools: Some(Tools { ffmpeg: Some("9.0".into()), browser: Some("145.0.7632.159.7".into()) }),
-        history: history(),
-        ..App::default()
-    };
+    let mut app = App::default();
+    app.paths = Paths { root: PathBuf::from("C:/Users/you/AppData/Local/Flacora") };
+    app.loaded = true;
+    app.installed = installed;
+    app.tools = Some(Tools { ffmpeg: Some("9.0".into()), browser: Some("145.0.7632.159.7".into()) });
+    app.history = history();
     app.settings.output = PathBuf::from("C:\\Users\\you\\Music\\Flacora");
     app
 }
@@ -95,6 +93,7 @@ pub fn job(app: &mut App, extension: &str, url: &str, status: Status) -> u64 {
         cover: None,
         log: Vec::new(),
         saved: Vec::new(),
+        fallback_saved: Vec::new(),
         show_log: false,
         finished: None,
         links: Vec::new(),
@@ -263,6 +262,26 @@ pub fn library_sources(s: &mut App) {
     legacy.url = "https://open.spotify.com/track/1CPZ5BxNNd0n0nF4Orb9JS".into();
 }
 
+pub fn library_batch(s: &mut App) {
+    library_lookups(s);
+    s.history[0].files = vec!["C:/Users/you/Music/Flacora/HUNTR_X - Golden (Tidal).flac".into()];
+    s.history[1].files = vec!["C:/Users/you/Music/Flacora/HUNTR_X - Golden (Missing).flac".into()];
+    s.library_files.insert(
+        s.history[0].files[0].clone(),
+        crate::library::SidecarInfo {
+            exists: true,
+            sidecars: vec![("LRC".into(), "C:/Users/you/Music/Flacora/HUNTR_X - Golden (Tidal).lrc".into())],
+        },
+    );
+    s.library_files.insert(
+        s.history[1].files[0].clone(),
+        crate::library::SidecarInfo { exists: false, sidecars: Vec::new() },
+    );
+    s.library_select_mode = true;
+    s.library_selected.insert(App::entry_selection_key(&s.history[0]));
+    s.library_selected.insert(App::entry_selection_key(&s.history[2]));
+}
+
 pub fn lookup_picker(s: &mut App) {
     library_lookups(s);
     let track = &s.history[0];
@@ -405,6 +424,34 @@ pub fn extensions_page(s: &mut App) {
     s.extension_status.insert("lucida".into(), ExtensionStatus::Services(services));
 }
 
+/// Newer versions are fixture data; the public Gist is never modified.
+pub fn extension_updates_available(s: &mut App) {
+    extensions_page(s);
+    let versions = crate::extension_updates::parse(br#"{"schema_version":1,"extensions":{"cyan-dl":{"version":"1.0.3"},"flacdownloader":{"version":"1.1.0"},"odskyler":{"version":"1.0.2"}}}"#).unwrap();
+    s.apply(crate::app::Msg::ExtensionVersionsChecked(Ok(versions)));
+}
+
+pub fn extension_updates_light(s: &mut App) {
+    extension_updates_available(s);
+    s.settings.theme = Theme::Light;
+}
+
+pub fn extension_updates_current(s: &mut App) {
+    extensions_page(s);
+    let versions = crate::extension_updates::parse(include_bytes!("fixtures/extension-updates.json")).unwrap();
+    s.apply(crate::app::Msg::ExtensionVersionsChecked(Ok(versions)));
+}
+
+pub fn extension_updates_failed(s: &mut App) {
+    extension_updates_available(s);
+    s.apply(crate::app::Msg::ExtensionVersionsChecked(Err("offline fixture".into())));
+}
+
+pub fn extension_updates_checking(s: &mut App) {
+    extensions_page(s);
+    s.check_extension_updates();
+}
+
 pub fn extensions_empty(s: &mut App) {
     fresh(s);
     s.page = Page::Extensions;
@@ -529,5 +576,7 @@ pub fn notifications(s: &mut App) {
 }
 
 pub fn loading(s: &mut App) {
-    *s = App { paths: Paths { root: PathBuf::from("C:/Users/you/AppData/Local/Flacora") }, ..App::default() };
+    let mut app = App::default();
+    app.paths = Paths { root: PathBuf::from("C:/Users/you/AppData/Local/Flacora") };
+    *s = app;
 }

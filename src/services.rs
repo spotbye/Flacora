@@ -15,13 +15,28 @@ impl Service {
     }
 }
 
+pub const AMAZON_HOSTS: &[&str] = &[
+    "music.amazon.com",
+    "music.amazon.co.uk",
+    "music.amazon.de",
+    "music.amazon.co.jp",
+    "music.amazon.fr",
+    "music.amazon.it",
+    "music.amazon.es",
+    "music.amazon.ca",
+    "music.amazon.com.au",
+    "music.amazon.com.br",
+    "music.amazon.com.mx",
+    "music.amazon.in",
+];
+
 /// The primary download services come first, followed by the optional Monochrome source and
 /// resolver input services. YouTube Music comes before YouTube so its host matches first.
 pub const SERVICES: [Service; 9] = [
     Service { key: "qobuz", name: "Qobuz", hosts: &["qobuz.com"] },
     Service { key: "tidal", name: "Tidal", hosts: &["tidal.com"] },
     Service { key: "deezer", name: "Deezer", hosts: &["deezer.com", "deezer.page.link"] },
-    Service { key: "amazon", name: "Amazon Music", hosts: &["music.amazon.com", "music.amazon.co.uk", "music.amazon.de", "music.amazon.co.jp"] },
+    Service { key: "amazon", name: "Amazon Music", hosts: AMAZON_HOSTS },
     Service { key: "monochrome", name: "Monochrome", hosts: &["monochrome.st"] },
     Service { key: "spotify", name: "Spotify", hosts: &["open.spotify.com", "spotify.link"] },
     Service { key: "apple", name: "Apple Music", hosts: &["music.apple.com", "geo.music.apple.com", "itunes.apple.com"] },

@@ -1,14 +1,16 @@
 //! Locally installed extensions and the package drop target.
 
+use super::theme::FLACORA;
 use super::theme::{FOCUS_RING_OFFSET, FOCUS_RING_WIDTH, Kit};
 use super::widgets::{self, badge, badge_with_icon, card, section, service_chip, status_badge};
 use crate::app::{App, ConfirmAction};
 use crate::extensions::Kind;
+use crate::extension_updates::{self, CheckState};
 use crate::icons;
 use crate::services;
 use crate::store::{self, ExtensionStatus, Installed};
 use rune::{Cursor, El, GrowthSpec, Link, LinkPaint, Spring, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Divider, Spinner};
+use crate::astryx::{Button, ButtonVariant, Divider, Spinner};
 
 const CATEGORIES: [(Kind, &str); 4] = [
     (Kind::Downloader, "downloaders"),
@@ -16,7 +18,7 @@ const CATEGORIES: [(Kind, &str); 4] = [
     (Kind::Metadata, "metadata"),
     (Kind::Lyrics, "lyrics"),
 ];
-const LIST_SPRING: Spring = Spring::new(0.26, 0.0);
+const LIST_SPRING: Spring = Spring::new(FLACORA.motion.extensions_response, FLACORA.motion.extensions_bounce);
 const EXTENSIONS_URL: &str = "https://rentry.org/flacora";
 
 fn select_filter(s: &mut App, tx: &mut Tx, filter: Option<Kind>) {
@@ -29,11 +31,14 @@ fn select_filter(s: &mut App, tx: &mut Tx, filter: Option<Kind>) {
 pub fn page(s: &App, k: &Kit, overlays: &mut Vec<El>) -> El {
     let mut actions = Vec::new();
     if s.loaded && !s.installed.is_empty() {
+        actions.push(widgets::icon_button(k, "check-extension-updates", &icons::REFRESH_CW,
+            "Check Extension Updates", App::check_extension_updates)
+            .disabled(s.extension_update_check == CheckState::Checking));
         let checking = s.any_checking();
         let label = if checking { "Checking Status…" } else { "Check Status" };
         actions.push(widgets::button(k, "check-extension-status", label, Some(&icons::REFRESH_CW), ButtonVariant::Outline,
             App::check_all).disabled(checking || s.importing > 0));
-        actions.push(widgets::button(k, "remove-all-extensions", "Remove All", Some(&icons::TRASH_2), ButtonVariant::Outline, |s| {
+        actions.push(widgets::button(k, "remove-all-extensions", "Remove All", Some(&icons::TRASH_2), ButtonVariant::Outline, |s: &mut App| {
             if s.removing.is_empty() {
                 s.confirm_action = Some(ConfirmAction::RemoveAllExtensions);
             }
@@ -45,12 +50,12 @@ pub fn page(s: &App, k: &Kit, overlays: &mut Vec<El>) -> El {
             .help("Browse for Extension Packages")
             .disabled(s.browsing_packages)
             .on_press_tx(App::browse_packages)
-            .build(k).h(32.0).key("install-extension"));
+            .action().build(k).key("install-extension"));
     }
     if s.confirm_action == Some(ConfirmAction::RemoveAllExtensions) {
         overlays.push(remove_all_dialog(s, k));
     }
-    let head = widgets::page_header_with_subtitle(k, "Extensions", download_link(k), actions);
+    let head = widgets::page_header_with_subtitle(k, "Extensions", update_summary(s, k), actions);
     let mut page = widgets::page("extensions-page").child(head);
     if s.loaded && s.installed.is_empty() {
         return page.child(col().w_full().grow(1.0).min_h(0.0).center().child(drop_zone(s, k)));
@@ -59,7 +64,15 @@ pub fn page(s: &App, k: &Kit, overlays: &mut Vec<El>) -> El {
     let mut list = col().key("extension-cards").growth(GrowthSpec::default());
     let mut filter_bar = None;
     if !s.loaded {
-        list = list.child(text("Loading Installed Extensions…").font(k.ty.body).color(k.c.text_muted));
+        list = list.child(
+            row()
+                .key("extensions-loading")
+                .role("status")
+                .gap(FLACORA.spacing.inline)
+                .center_y()
+                .child(Spinner::new().size(FLACORA.spinner.inline).build(k))
+                .child(text("Loading Installed Extensions…").font(k.ty.body).color(k.c.text_muted)),
+        );
     } else {
         let present_categories: Vec<_> = CATEGORIES
             .iter()
@@ -70,17 +83,18 @@ pub fn page(s: &App, k: &Kit, overlays: &mut Vec<El>) -> El {
             .collect();
         let active_filter = s.extension_filter.filter(|kind| present_categories.iter().any(|(k, _, _)| k == kind));
         if present_categories.len() > 1 {
+            let total = present_categories.len() + 1;
             let mut chips = widgets::filter_group("extension-filters", "Extension Type")
                 .child(widgets::filter_button(
                     k, "ext-filter-all".into(), format!("All ({})", s.installed.len()),
                     active_filter.is_none(), None, |s, tx| select_filter(s, tx, None),
-                ));
-            for &(kind, key, count) in &present_categories {
+                ).position_in_set(1, total));
+            for (idx, &(kind, key, count)) in present_categories.iter().enumerate() {
                 let selected = active_filter == Some(kind);
                 chips = chips.child(widgets::filter_button(
                     k, format!("ext-filter-{key}"), format!("{} ({count})", kind.label()), selected, None,
                     move |s, tx| select_filter(s, tx, Some(kind)),
-                ));
+                ).position_in_set(idx + 2, total));
             }
             filter_bar = Some(chips);
         }
@@ -95,15 +109,15 @@ pub fn page(s: &App, k: &Kit, overlays: &mut Vec<El>) -> El {
             }
             installed.sort_by_cached_key(|i| i.manifest.name.to_lowercase());
             rows.push(section(k, kind.label(), Some(installed.len())).key(format!("extension-category-{key}")));
-            rows.push(el().key(format!("gap-after-category-{key}")).h(10.0).a11y_hidden());
+            rows.push(el().key(format!("gap-after-category-{key}")).h(FLACORA.spacing.row).a11y_hidden());
             for extension in installed {
                 rows.push(extension_card(s, k, extension));
-                rows.push(el().key(format!("gap-after-card-{}", extension.manifest.id)).h(10.0).a11y_hidden());
+                rows.push(el().key(format!("gap-after-card-{}", extension.manifest.id)).h(FLACORA.spacing.row).a11y_hidden());
             }
         }
         // Grow the gaps with the rows so they do not snap shut at the end of a collapse.
         rows.pop();
-        list = list.children(rows.into_iter().map(|row| row.fold_glide(LIST_SPRING).fold_feather(4.0)));
+        list = list.children(rows.into_iter().map(|row| row.fold_glide(LIST_SPRING).fold_feather(FLACORA.motion.extensions_feather)));
     }
     if let Some(chips) = filter_bar {
         page = page.child(chips);
@@ -121,15 +135,34 @@ fn remove_all_dialog(s: &App, k: &Kit) -> El {
         format!("This will uninstall {extensions}. You can reinstall them from their .fext packages.")
     };
     let keep = widgets::button(k, "keep-extensions", "Keep Extensions", None, ButtonVariant::Neutral,
-        |s| s.confirm_action = None);
+        |s: &mut App| s.confirm_action = None);
     let remove = widgets::button(k, "confirm-remove-all-extensions", "Remove All", Some(&icons::TRASH_2), ButtonVariant::Danger,
         App::remove_all_extensions).disabled(count == 0 || blocker.is_some());
     widgets::confirmation_dialog(k, "remove-all-extensions", "Remove all extensions?", detail,
         "remove-all-extensions", keep, remove)
 }
 
+fn update_summary(s: &App, k: &Kit) -> El {
+    let mut summary = col().gap(FLACORA.spacing.small).child(download_link(k));
+    let message = match s.extension_update_check {
+        CheckState::Idle => return summary,
+        CheckState::Checking => "Checking extension versions…".to_owned(),
+        CheckState::Failed => if s.extension_versions.is_empty() {
+            "Could not check updates. Try again.".to_owned()
+        } else { "Could not check updates. Try again. Previous results are kept.".to_owned() },
+        CheckState::Ready => {
+            let count = s.installed.iter().filter(|i| extension_updates::newer(&s.extension_versions, &i.manifest.id, &i.manifest.version).is_some()).count();
+            if count > 0 { format!("{count} update{} available. Download packages manually.", if count == 1 { "" } else { "s" }) }
+            else { "Version information checked.".to_owned() }
+        }
+    };
+    summary = summary.child(text(message).key("extension-update-summary").role("status")
+        .font(k.ty.small).color(if s.extension_update_check == CheckState::Failed { k.c.warning.fg } else { k.c.text_muted }).wrap());
+    summary
+}
+
 fn download_link(k: &Kit) -> El {
-    let label = "Get Extension on Rentry";
+    let label = "Get Extensions on Rentry";
     let link = Link::new(0..label.len(), EXTENSIONS_URL)
         .hover(LinkPaint::new().underline(k.c.info.fg));
     text(label).key("download-extensions").self_start().font(k.ty.body_medium).color(k.c.info.fg)
@@ -155,11 +188,11 @@ fn drop_zone(s: &App, k: &Kit) -> El {
     let accent = if active { k.c.border_focus } else { k.c.text_strong };
     let hint_color = k.drop_hint;
     let symbol = if installing {
-        Spinner::new().size(24.0).build(k)
+        Spinner::new().size(FLACORA.spinner.large).build(k)
     } else {
-        icon(&icons::FILE_UP, 28.0).color(accent)
+        icon(&icons::FILE_UP, FLACORA.artwork.drop_glyph).color(accent)
     };
-    let mut message = col().center().gap(6.0)
+    let mut message = col().center().gap(FLACORA.spacing.label)
         .child(text(label).role(if installing { "status" } else { "heading" }).font(k.subheading).color(accent));
     if !installing {
         message = message.child(
@@ -167,8 +200,8 @@ fn drop_zone(s: &App, k: &Kit) -> El {
         );
     }
 
-    col().w_full().max_w(560.0).h(224.0).center().gap(16.0)
-        .child(el().size(56.0, 56.0).center().radius(999.0).fill(if active { k.c.layer_04 } else { k.c.layer_02 })
+    col().w_full().max_w(FLACORA.overlay.extension_drop_width).h(FLACORA.overlay.extension_drop_height).center().gap(FLACORA.spacing.section)
+        .child(el().size(FLACORA.artwork.drop_frame, FLACORA.artwork.drop_frame).center().radius(FLACORA.artwork.round_radius).fill(if active { k.c.layer_04 } else { k.c.layer_02 })
             .child(symbol).a11y_hidden())
         .child(message)
         .key("drop-zone")
@@ -178,10 +211,10 @@ fn drop_zone(s: &App, k: &Kit) -> El {
         .focus_ring(FOCUS_RING_WIDTH, FOCUS_RING_OFFSET, k.c.border_focus)
         .cursor(Cursor::Pointer)
         .radius(k.radius.md)
-        .fill(if active { k.c.layer_04.alpha(0.35) } else { k.c.bg_base })
+        .fill(if active { k.colors.drop_target_active } else { k.c.bg_base })
         .hover(k.c.hover)
-        .border(if active { 2.0 } else { 1.0 }, if active { k.c.border_focus } else { k.c.border_strong })
-        .border_dash(6.0, 4.0)
+        .border(if active { FLACORA.border.emphasis } else { FLACORA.border.normal }, if active { k.c.border_focus } else { k.c.border_strong })
+        .border_dash(FLACORA.overlay.extension_dash_length, FLACORA.overlay.dash_gap)
         .on_press_tx(App::browse_packages)
 }
 
@@ -197,28 +230,58 @@ fn extension_card(s: &App, k: &Kit, installed: &Installed) -> El {
         .unwrap_or(manifest.description.trim());
     let site_url = crate::extensions::site_url(&manifest.description);
 
-    let title = row().gap(6.0).center_y().flex_wrap()
+    let mut title = row().gap(FLACORA.spacing.label).center_y().flex_wrap()
         .child(text(manifest.name.clone()).font(k.ty.body_medium).color(k.c.text_strong))
         .child(badge(k, format!("v{}", manifest.version)));
-    let mut info = col().items_start().gap(6.0).grow(1.0).shrink().min_w(0.0).child(title);
-    if !website.is_empty() && let Some(href) = site_url {
-        let link = Link::new(0..website.len(), href)
-            .hover(LinkPaint::new().color(k.c.text_base).underline(k.c.text_base));
-        info = info.child(
-            text(website.to_owned()).key(format!("site-{id}"))
-                .font(k.ty.small.lh(20.0)).color(k.c.text_muted).truncate()
+    if let Some(latest) = extension_updates::newer(&s.extension_versions, id, &manifest.version) {
+        let update_text = format!("v{latest} available");
+        let link = Link::new(0..update_text.len(), EXTENSIONS_URL)
+            .hover(LinkPaint::new().underline(k.c.info.fg));
+        title = title.child(
+            text(update_text)
+                .key(format!("extension-update-{id}"))
+                .role("status")
+                .label(format!("Update available: version {latest}. Installed version {}. Download the package manually.", manifest.version))
+                .help("Open Rentry to download the updated .fext package, then drop it into Flacora.")
+                .font(k.ty.small_medium)
+                .color(k.c.info.fg)
                 .link(link)
                 .on_link(|s: &mut App, url, tx| {
                     if let Err(error) = tx.open_url(url) {
-                        s.error(format!("Could not open website: {error}"));
+                        s.error(format!("Could not open Rentry: {error}"));
                     }
                 }),
         );
     }
+    let mut info = col().items_start().gap(FLACORA.spacing.label).grow(1.0).shrink().min_w(0.0).child(title);
+    if !website.is_empty() {
+        if let Some(href) = site_url {
+            let link = Link::new(0..website.len(), href)
+                .hover(LinkPaint::new().color(k.c.text_base).underline(k.c.text_base));
+            info = info.child(
+                text(website.to_owned()).key(format!("site-{id}"))
+                    .font(k.ty.text_small).color(k.c.text_muted).truncate()
+                    .link(link)
+                    .on_link(|s: &mut App, url, tx| {
+                        if let Err(error) = tx.open_url(url) {
+                            s.error(format!("Could not open website: {error}"));
+                        }
+                    }),
+            );
+        } else {
+            info = info.child(
+                text(website.to_owned())
+                    .key(format!("desc-{id}"))
+                    .font(k.ty.text_small)
+                    .color(k.c.text_muted)
+                    .wrap(),
+            );
+        }
+    }
     if !kind.is_lookup() {
         let service_names = s.services_of(id, &manifest.services);
         if !service_names.is_empty() {
-            info = info.child(row().key(format!("services-{id}")).gap(6.0).center_y().flex_wrap()
+            info = info.child(row().key(format!("services-{id}")).gap(FLACORA.spacing.label).center_y().flex_wrap()
                 .children(service_names.iter().map(|service| service_badge(s, k, service))));
         }
     }
@@ -232,21 +295,21 @@ fn extension_card(s: &App, k: &Kit, installed: &Installed) -> El {
         );
     }
 
-    let header = row().key("header").w_full().gap(14.0).center_y()
+    let header = row().key("header").w_full().gap(FLACORA.spacing.media).center_y()
         .child(kind_tile(k, id, kind))
         .child(info)
         .child(card_actions(s, k, installed));
     let mut body = col().w_full().child(header);
     if !manifest.options.is_empty() && s.extension_settings.as_deref() == Some(id) {
-        let mut options = col().key(format!("extension-options-{id}")).w_full().gap(8.0);
+        let mut options = col().key(format!("extension-options-{id}")).w_full().gap(FLACORA.spacing.inline);
         for option in &manifest.options {
             options = options.child(
-                row().w_full().gap(12.0).center_y().flex_wrap()
+                row().w_full().gap(FLACORA.spacing.group).center_y().flex_wrap()
                     .child(text(widgets::title_case_label(&option.label)).font(k.ty.small_medium).color(k.c.text_strong).grow(1.0))
                     .child(widgets::extension_option(k, s, id, option, &format!("setting-{id}-{}", option.key))),
             );
         }
-        body = body.child(col().key("settings-panel").w_full().pt(12.0).gap(12.0)
+        body = body.child(col().key("settings-panel").w_full().pt(FLACORA.spacing.group).gap(FLACORA.spacing.group)
             .child(Divider::horizontal().build(k))
             .child(options));
     }
@@ -254,28 +317,28 @@ fn extension_card(s: &App, k: &Kit, installed: &Installed) -> El {
 }
 
 fn kind_tile(k: &Kit, id: &str, kind: Kind) -> El {
-    let (glyph, light, dark) = match kind {
-        Kind::Downloader => (&icons::CLOUD_DOWNLOAD, ["#b9d7ff", "#003978"], ["#253c5a", "#a1caff"]),
-        Kind::Resolver => (&icons::SHARE_2, ["#a9e2d6", "#00463d"], ["#28413c", "#81c9bb"]),
-        Kind::Lyrics => (&icons::MIC_VOCAL, ["#f7d5ff", "#5c0e6c"], ["#4a2f51", "#eaacf8"]),
-        Kind::Metadata => (&icons::TAG, ["#fae19e", "#4b3900"], ["#453a1c", "#e3c36c"]),
+    let (glyph, tile_index) = match kind {
+        Kind::Downloader => (&icons::CLOUD_DOWNLOAD, 0),
+        Kind::Resolver => (&icons::SHARE_2, 1),
+        Kind::Lyrics => (&icons::MIC_VOCAL, 2),
+        Kind::Metadata => (&icons::TAG, 3),
     };
-    let [fill, ink] = if k.dark { dark } else { light }.map(|hex| rune::color::hex(hex).expect("extension accent"));
+    let [fill, ink] = k.colors.kind_tile(tile_index);
     el().key(format!("kind-{id}"))
         .role("img")
         .label(kind.label())
         .help(kind.label())
-        .size(44.0, 44.0)
+        .size(FLACORA.artwork.kind_tile, FLACORA.artwork.kind_tile)
         .radius(k.radius.md)
         .fill(fill)
         .center()
-        .child(icon(glyph, 22.0).key(glyph.name).color(ink).a11y_hidden())
+        .child(icon(glyph, FLACORA.artwork.kind_glyph).key(glyph.name).color(ink).a11y_hidden())
 }
 
 fn service_badge(s: &App, k: &Kit, name: &str) -> El {
     let service = services::by_name(name);
     if let Some(service) = service
-        && let Some(logo) = widgets::provider_logo(s, service, 14.0)
+        && let Some(logo) = widgets::provider_logo(s, service, FLACORA.artwork.provider_inline)
     {
         return badge_with_icon(k, service.name, logo);
     }
@@ -285,26 +348,34 @@ fn service_badge(s: &App, k: &Kit, name: &str) -> El {
 fn card_actions(s: &App, k: &Kit, installed: &Installed) -> El {
     let id = &installed.manifest.id;
     if s.removing.contains(id) {
-        return row().gap(6.0).center_y()
-            .child(Spinner::new().size(14.0).build(k))
+        return row().gap(FLACORA.spacing.label).center_y()
+            .child(Spinner::new().size(FLACORA.spinner.inline).build(k))
             .child(text("Removing…").font(k.ty.small).color(k.c.text_muted));
     }
     let confirming = s.confirm_action.as_ref() == Some(&ConfirmAction::RemoveExtension(id.clone()));
     let remove_id = id.to_owned();
     let disabled = s.importing > 0 || s.running_extension(id) || s.status_command_running(installed);
     let remove = if confirming {
-        widgets::button(k, &format!("remove-{id}"), "Confirm", Some(&icons::TRASH_2), ButtonVariant::Danger, move |s: &mut App| {
-            s.confirm_action = None;
-            s.remove(&remove_id);
-        })
-        .disabled(disabled)
+        row()
+            .gap(FLACORA.spacing.small)
+            .center_y()
+            .child(widgets::button(k, &format!("cancel-remove-{id}"), "Cancel", None, ButtonVariant::Ghost, |s: &mut App| {
+                s.confirm_action = None;
+            }))
+            .child(
+                widgets::button(k, &format!("remove-{id}"), "Confirm", Some(&icons::TRASH_2), ButtonVariant::Danger, move |s: &mut App| {
+                    s.confirm_action = None;
+                    s.remove(&remove_id);
+                })
+                .disabled(disabled),
+            )
     } else {
         widgets::danger_icon_button(k, &format!("remove-{id}"), &icons::TRASH_2, "Remove", move |s: &mut App| {
             s.confirm_action = Some(ConfirmAction::RemoveExtension(remove_id.clone()));
         })
         .disabled(disabled)
     };
-    let mut actions = row().gap(8.0).center_y();
+    let mut actions = row().gap(FLACORA.spacing.inline).center_y();
     if !installed.manifest.options.is_empty() {
         let id = id.clone();
         let expanded = s.extension_settings.as_deref() == Some(&id);
@@ -317,6 +388,14 @@ fn card_actions(s: &App, k: &Kit, installed: &Installed) -> El {
         }
         actions = actions.child(gear);
     }
+    let data_id = id.clone();
+    actions = actions.child(widgets::icon_button(
+        k,
+        &format!("data-{id}"),
+        &icons::FOLDER,
+        "Open Data Folder",
+        move |s: &mut App| s.open_extension_data(&data_id),
+    ));
     actions
         .child(online_status(s, k, id))
         .child(remove)
@@ -355,7 +434,7 @@ fn online_status(s: &App, k: &Kit, id: &str) -> El {
     let badge = status_badge(k, glyph, label, colors);
     if can_recheck {
         let id = id.to_owned();
-        return row().h(28.0).center().radius(10.0)
+        return row().h(FLACORA.badge.interactive_height).center().radius(FLACORA.badge.status_radius)
             .role("button")
             .label(label)
             .key(key).help(help)

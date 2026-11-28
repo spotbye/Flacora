@@ -12,5 +12,7 @@
 
 #### [Troubleshooting](TROUBLESHOOTING.md)
 
+#### [Building](BUILDING.md)
+
 #### Disclaimer
 <sup>Flacora is an independent open-source project. Service names and logos identify compatible music services and belong to their respective owners. Downloads require separately installed extensions. Use Flacora only for content you have permission to download, and follow the applicable laws and service terms.</sup>

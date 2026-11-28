@@ -8,6 +8,7 @@ pub use notifications::{Notification, NotificationKind, UndoAction};
 
 use crate::{
     extensions,
+    extension_updates::{self, CheckState, Versions},
     jobs::Job,
     library::{self, Entry},
     runner::JobEvent,
@@ -36,6 +37,24 @@ pub enum Page {
     Library,
     Extensions,
     Settings,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum QueueFilter {
+    #[default]
+    All,
+    Active,
+    Choosing,
+    Failed,
+    Done,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum LibraryStatusFilter {
+    #[default]
+    All,
+    HasLyrics,
+    Missing,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -83,6 +102,8 @@ pub enum Msg {
     ExtensionsRemoved(Vec<(String, Result<(), String>)>),
     Tools(Tools),
     UpdateChecked(Option<updates::Release>),
+    ManualUpdateChecked(Result<Option<updates::Release>, String>),
+    ExtensionVersionsChecked(Result<Versions, String>),
     ExtensionStatus { id: String, check: u64, status: ExtensionStatus },
     SettingsSaved(Result<(), String>),
     HistorySaved(Result<(), String>),
@@ -95,9 +116,11 @@ pub enum Msg {
     TagsWritten(u64, Result<library::TaggedTrack, String>),
     /// Cover art for a job: the cached file and its bytes.
     JobCover(u64, PathBuf, Vec<u8>),
-    /// Bytes of a cached cover, for the history.
-    Image(String, Vec<u8>),
-    LibraryFiles(BTreeMap<String, library::SidecarInfo>),
+    /// Bytes of a cached cover, for the history (`None` when the file could not be read).
+    Image(String, Option<Vec<u8>>),
+    LibraryFiles(u64, BTreeMap<String, library::SidecarInfo>),
+    TrackSpecs(String, Option<library::TrackSpecs>),
+    LibraryExported(Result<(PathBuf, usize), String>),
     Error(String),
 }
 
@@ -141,12 +164,20 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub next_job: u64,
     pub queue_paused: bool,
+    pub queue_filter: QueueFilter,
     pub queue_menu_open: bool,
     pub history: Vec<Entry>,
     pub library_sort: LibrarySort,
     pub library_service: Option<String>,
+    pub library_status_filter: LibraryStatusFilter,
+    pub library_select_mode: bool,
+    pub library_selected: BTreeSet<(u64, String)>,
+    pub library_batch_lookup_open: bool,
     pub library_files: BTreeMap<String, library::SidecarInfo>,
+    pub(crate) library_scan_serial: u64,
     pub lookup_picker: Option<(u64, String)>,
+    pub track_inspector: Option<(u64, String)>,
+    pub track_specs: BTreeMap<String, Option<library::TrackSpecs>>,
     pub extension_settings: Option<String>,
     pub extension_filter: Option<extensions::Kind>,
     pub(crate) settings_save: SaveState,
@@ -157,6 +188,10 @@ pub struct App {
     pub image_cache: Option<ImageCache>,
     pub tools: Option<Tools>,
     pub available_update: Option<updates::Release>,
+    pub checking_app_update: bool,
+    pub extension_versions: Versions,
+    pub extension_update_check: CheckState,
+    pub extension_update_error: Option<String>,
     pub extension_status: BTreeMap<String, ExtensionStatus>,
     /// Extensions whose status check is running.
     pub checking: BTreeMap<String, u64>,
@@ -169,7 +204,8 @@ pub struct App {
     pub provider_logos: BTreeMap<&'static str, Image>,
     pub notice: Option<Notification>,
     pub info: Option<Notification>,
-    pub toast_hovered: bool,
+    pub notice_hovered: bool,
+    pub info_hovered: bool,
     pub undo: Option<UndoAction>,
     pub confirm_action: Option<ConfirmAction>,
     /// Package files being installed.
@@ -200,12 +236,20 @@ impl Default for App {
             jobs: Vec::new(),
             next_job: 1,
             queue_paused: false,
+            queue_filter: QueueFilter::All,
             queue_menu_open: false,
             history: Vec::new(),
             library_sort: LibrarySort::Newest,
             library_service: None,
+            library_status_filter: LibraryStatusFilter::All,
+            library_select_mode: false,
+            library_selected: BTreeSet::new(),
+            library_batch_lookup_open: false,
             library_files: BTreeMap::new(),
+            library_scan_serial: 0,
             lookup_picker: None,
+            track_inspector: None,
+            track_specs: BTreeMap::new(),
             extension_settings: None,
             extension_filter: None,
             settings_save: SaveState::Idle,
@@ -215,6 +259,10 @@ impl Default for App {
             image_cache: None,
             tools: None,
             available_update: None,
+            checking_app_update: false,
+            extension_versions: Versions::new(),
+            extension_update_check: CheckState::Idle,
+            extension_update_error: None,
             extension_status: BTreeMap::new(),
             checking: BTreeMap::new(),
             status_queue: VecDeque::new(),
@@ -225,7 +273,8 @@ impl Default for App {
             provider_logos: BTreeMap::new(),
             notice: None,
             info: None,
-            toast_hovered: false,
+            notice_hovered: false,
+            info_hovered: false,
             undo: None,
             confirm_action: None,
             importing: 0,
@@ -236,6 +285,20 @@ impl Default for App {
             drop_over: false,
             waker: None,
             link: None,
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.link.is_none() {
+            return;
+        }
+        if self.settings_save != SaveState::Idle {
+            let _ = store::save_settings(&self.paths, &self.settings);
+        }
+        if self.history_save != SaveState::Idle {
+            let _ = library::save(&self.paths, &self.history);
         }
     }
 }
@@ -257,13 +320,23 @@ impl App {
         }
         self.link = Some(Link::new(waker));
         let paths = self.paths.clone();
-        self.background(move || Msg::Loaded {
-            installed: store::load_installed(&paths),
-            settings: store::load_settings(&paths),
-            history: library::load(&paths),
+        self.background(move || {
+            store::cleanup_stale_temps(&paths);
+            Msg::Loaded {
+                installed: store::load_installed(&paths),
+                settings: store::load_settings(&paths),
+                history: library::load(&paths),
+            }
         });
         self.refresh_tools();
         self.background(|| Msg::UpdateChecked(updates::check()));
+        self.check_extension_updates();
+    }
+
+    pub fn check_extension_updates(&mut self) {
+        if self.extension_update_check == CheckState::Checking { return; }
+        self.extension_update_check = CheckState::Checking;
+        self.background(|| Msg::ExtensionVersionsChecked(extension_updates::check()));
     }
 
     pub fn background(&self, work: impl FnOnce() -> Msg + Send + 'static) {
@@ -301,7 +374,8 @@ impl App {
                 Msg::Loaded { .. }
                     | Msg::Tools(_)
                     | Msg::UpdateChecked(_)
-                    | Msg::LibraryFiles(_)
+                    | Msg::ExtensionVersionsChecked(_)
+                    | Msg::LibraryFiles(_, _)
                     | Msg::Image(_, _)
                     | Msg::ExtensionStatus { .. }
             ) {
@@ -357,6 +431,7 @@ impl App {
                         self.check_status(&id);
                     }
                     self.apply_waiting_batch_services();
+                    self.pump();
                 } else {
                     self.start_import();
                 }
@@ -399,11 +474,37 @@ impl App {
             }
             Msg::Tools(tools) => self.tools = Some(tools),
             Msg::UpdateChecked(release) => self.available_update = release,
+            Msg::ManualUpdateChecked(result) => {
+                self.checking_app_update = false;
+                match result {
+                    Ok(Some(release)) => {
+                        self.success(format!("Flacora v{} is available.", release.version));
+                        self.available_update = Some(release);
+                    }
+                    Ok(None) => {
+                        self.available_update = None;
+                        self.success(format!("Flacora v{} is up to date.", updates::CURRENT_VERSION));
+                    }
+                    Err(error) => self.warn(error),
+                }
+            }
+            Msg::ExtensionVersionsChecked(result) => match result {
+                Ok(versions) => {
+                    self.extension_versions = versions;
+                    self.extension_update_check = CheckState::Ready;
+                    self.extension_update_error = None;
+                }
+                Err(error) => {
+                    self.extension_update_check = CheckState::Failed;
+                    self.extension_update_error = Some(error);
+                }
+            },
             Msg::ExtensionStatus { id, check, status } => {
                 if self.checking.get(&id) == Some(&check) {
                     self.checking.remove(&id);
                     self.extension_status.insert(id, status);
                     self.pump_status_checks();
+                    self.pump();
                 }
             }
             Msg::SettingsSaved(result) => {
@@ -436,9 +537,31 @@ impl App {
             Msg::JobCover(id, path, bytes) => self.job_cover(id, path, bytes),
             Msg::Image(path, bytes) => {
                 self.cover_loading.remove(&path);
-                self.load_image(path, bytes);
+                if let Some(bytes) = bytes {
+                    self.load_image(path, bytes);
+                }
             }
-            Msg::LibraryFiles(files) => self.library_files = files,
+            Msg::LibraryFiles(serial, files) => {
+                if serial == self.library_scan_serial {
+                    self.library_files = files;
+                }
+            }
+            Msg::TrackSpecs(path, specs) => {
+                self.track_specs.insert(path, specs);
+            }
+            Msg::LibraryExported(result) => match result {
+                Ok((path, count)) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.success(format!(
+                        "Exported {count} track{} to {name}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(error) => self.error(format!("Could not export library: {error}")),
+            },
             Msg::Error(e) if e.is_empty() => {}
             Msg::Error(e) => self.error(e),
         }
@@ -463,6 +586,7 @@ impl App {
     fn forget_extension(&mut self, id: &str) {
         self.installed.retain(|i| i.manifest.id != id);
         self.forget_status(id);
+        self.catalog.clear_for_removed(id);
         if self.extension_settings.as_deref() == Some(id) {
             self.extension_settings = None;
         }
@@ -605,6 +729,7 @@ impl App {
 
     pub(crate) fn load_history_covers(&mut self) {
         const INITIAL_COVERS: usize = 64;
+        let Some(link) = &self.link else { return };
         let mut seen = BTreeSet::new();
         let covers: Vec<String> = self
             .history
@@ -620,17 +745,14 @@ impl App {
         for path in &covers {
             self.cover_loading.insert(path.clone());
         }
-        if let Some(link) = &self.link {
-            let send = link.sender();
-            let paths = self.paths.clone();
-            thread::spawn(move || {
-                for path in covers {
-                    if let Some(bytes) = library::read_cover(&paths, &path) {
-                        send(Msg::Image(path, bytes));
-                    }
-                }
-            });
-        }
+        let send = link.sender();
+        let paths = self.paths.clone();
+        thread::spawn(move || {
+            for path in covers {
+                let bytes = library::read_cover(&paths, &path);
+                send(Msg::Image(path, bytes));
+            }
+        });
     }
 
     pub fn request_history_cover(&mut self, path: &str) {
@@ -639,7 +761,10 @@ impl App {
         }
         let paths = self.paths.clone();
         let path = path.to_owned();
-        self.background_opt(move || library::read_cover(&paths, &path).map(|bytes| Msg::Image(path, bytes)));
+        self.background(move || {
+            let bytes = library::read_cover(&paths, &path);
+            Msg::Image(path, bytes)
+        });
     }
 
     pub fn dark(&self, system_dark: bool) -> bool {

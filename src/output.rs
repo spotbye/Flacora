@@ -93,7 +93,7 @@ impl Layout {
         match self.publish(staging.path(), output, files, names) {
             Ok(paths) => Ok(paths
                 .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|path| crate::runner::strip_win_verbatim(&path).to_string_lossy().into_owned())
                 .collect()),
             Err(error) => Err(format!(
                 "Could not organize the download: {error}. Files kept in {}",
@@ -124,6 +124,12 @@ impl Layout {
                     "The extension reported a file outside its download folder",
                 ));
             }
+            if !crate::runner::is_safe_open_file(&source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "The extension reported an unsupported file type",
+                ));
+            }
             if !sources.contains(&source) {
                 sources.push(source);
             }
@@ -134,17 +140,25 @@ impl Layout {
                 path.extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
             })
+            .or_else(|| {
+                sources
+                    .iter()
+                    .find(|path| crate::library::is_audio_file(&path.to_string_lossy()))
+            })
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "The extension did not report a saved FLAC file",
+                    "The extension did not report a saved audio file",
                 )
             })?;
         let original = main
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("Track");
-        let tags = metaflac::Tag::read_from_path(main).ok();
+        let is_flac = main
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"));
+        let tags = is_flac.then(|| metaflac::Tag::read_from_path(main).ok()).flatten();
         let tag = |key| {
             tags.as_ref()?
                 .get_vorbis(key)?
@@ -165,6 +179,11 @@ impl Layout {
             Filename::Title => title.to_owned(),
         };
 
+        let (folder_cap, file_cap) = match self.folders {
+            Folders::Single => (160, 160),
+            Folders::Artist => (110, 140),
+            Folders::ArtistAlbum => (70, 100),
+        };
         let mut directory = std::path::absolute(output)?;
         let base = directory.canonicalize()?;
         if self.folders != Folders::Single {
@@ -175,44 +194,78 @@ impl Layout {
             };
             directory = subfolder(
                 &directory,
-                &component(folder_artist, "Unknown Artist"),
+                &component_capped(folder_artist, "Unknown Artist", folder_cap),
                 &base,
             )?;
         }
         if self.folders == Folders::ArtistAlbum {
-            directory = subfolder(&directory, &component(album, "Unknown Album"), &base)?;
+            directory = subfolder(
+                &directory,
+                &component_capped(album, "Unknown Album", folder_cap),
+                &base,
+            )?;
         }
 
-        let same_track =
-            |path: &Path| path.parent() == main.parent() && path.file_stem() == main.file_stem();
+        let main_stem = main.file_stem().and_then(|s| s.to_str());
+        let same_track = |path: &Path| {
+            if path.parent() != main.parent() {
+                return false;
+            }
+            if path.file_stem() == main.file_stem() {
+                return true;
+            }
+            let (Some(ms), Some(name)) = (main_stem, path.file_name().and_then(|n| n.to_str())) else {
+                return false;
+            };
+            sidecar_suffix_for_stem(name, ms).is_some()
+        };
         let bundle = sources
             .iter()
             .map(PathBuf::as_path)
             .filter(|path| same_track(path))
             .collect::<Vec<_>>();
-        let bundle_stem = available_stem(&directory, &component(&stem, "Track"), &bundle, true)?;
-        let mut published = Vec::new();
-        let result = (|| {
-            for source in &sources {
-                let stem = if same_track(source) {
-                    bundle_stem.clone()
-                } else {
-                    let original = source.file_stem().unwrap_or_default().to_string_lossy();
-                    available_stem(&directory, &component(&original, "File"), &[source], false)?
-                };
-                let path = target_path(&directory, &stem, source);
-                copy_file(source, &path)?;
-                published.push(path);
+        let clean_stem = component_capped(&stem, "Track", file_cap);
+        for attempt in 0..8 {
+            let bundle_stem = available_stem(&directory, &clean_stem, &bundle, main_stem, true)?;
+            let mut published = Vec::new();
+            let result: io::Result<()> = (|| {
+                for source in &sources {
+                    let is_bundle = same_track(source);
+                    let path = if is_bundle {
+                        target_path(&directory, &bundle_stem, source, main_stem)
+                    } else {
+                        let orig = source.file_stem().unwrap_or_default().to_string_lossy();
+                        let other_stem = available_stem(
+                            &directory,
+                            &component_capped(&orig, "File", file_cap),
+                            &[source],
+                            None,
+                            false,
+                        )?;
+                        target_path(&directory, &other_stem, source, None)
+                    };
+                    copy_file(source, &path)?;
+                    published.push(path);
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(published),
+                Err(error) => {
+                    for path in &published {
+                        let _ = fs::remove_file(path);
+                    }
+                    if error.kind() == io::ErrorKind::AlreadyExists && attempt < 7 {
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            for path in &published {
-                let _ = fs::remove_file(path);
-            }
-            return Err(error);
         }
-        Ok(published)
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "No free filename for the download",
+        ))
     }
 }
 
@@ -234,7 +287,12 @@ fn subfolder(parent: &Path, name: &str, base: &Path) -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(test)]
 fn component(input: &str, fallback: &str) -> String {
+    component_capped(input, fallback, 160)
+}
+
+fn component_capped(input: &str, fallback: &str, max_bytes: usize) -> String {
     let mut name: String = input
         .chars()
         .map(|c| {
@@ -244,9 +302,9 @@ fn component(input: &str, fallback: &str) -> String {
                 c
             }
         })
-        .take(160)
+        .take(max_bytes)
         .collect();
-    while name.len() > 160 {
+    while name.len() > max_bytes {
         name.pop();
     }
     let name = name.trim_matches(|c: char| c.is_whitespace() || c == '.');
@@ -277,10 +335,26 @@ fn component(input: &str, fallback: &str) -> String {
     }
 }
 
-fn target_path(directory: &Path, stem: &str, source: &Path) -> PathBuf {
+/// Returns a multi-dot sidecar suffix (like `musicbrainz.json`) when `name` matches `<stem>.<tag>.json`.
+fn sidecar_suffix_for_stem<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(stem)?.strip_prefix('.')?;
+    let (mid, ext) = rest.split_once('.')?;
+    if !mid.is_empty() && !mid.contains('.') && ext.eq_ignore_ascii_case("json") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn target_path(directory: &Path, stem: &str, source: &Path, main_stem: Option<&str>) -> PathBuf {
+    if let (Some(ms), Some(name)) = (main_stem, source.file_name().and_then(|n| n.to_str()))
+        && let Some(multi_ext) = sidecar_suffix_for_stem(name, ms)
+    {
+        return directory.join(format!("{stem}.{multi_ext}"));
+    }
     let extension = source
         .extension()
-        .map(|ext| format!(".{}", component(&ext.to_string_lossy(), "file")))
+        .map(|ext| format!(".{}", component_capped(&ext.to_string_lossy(), "file", 32)))
         .unwrap_or_default();
     directory.join(format!("{stem}{extension}"))
 }
@@ -289,6 +363,7 @@ fn available_stem(
     directory: &Path,
     stem: &str,
     files: &[&Path],
+    main_stem: Option<&str>,
     reserve_lookup_files: bool,
 ) -> io::Result<String> {
     let unused = |path: PathBuf| {
@@ -306,7 +381,7 @@ fn available_stem(
         .find(|candidate| {
             files
                 .iter()
-                .all(|file| unused(target_path(directory, candidate, file)))
+                .all(|file| unused(target_path(directory, candidate, file, main_stem)))
                 && (!reserve_lookup_files
                     || [
                         "lrc",
@@ -420,5 +495,44 @@ mod tests {
         assert_eq!(component("  nul.backup. ", "Track"), "_nul.backup");
         assert_eq!(component("...  ", "Track"), "Track");
         assert!(component(&"é".repeat(200), "Track").len() <= 160);
+    }
+
+    #[test]
+    fn preserves_multi_dot_metadata_sidecars_and_rejects_executables() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            filename: Filename::Title,
+            folders: Folders::Single,
+        };
+        let stage = layout.staging(root.path()).unwrap().unwrap();
+        fs::write(stage.path().join("track.flac"), b"fLaC").unwrap();
+        fs::write(stage.path().join("track.musicbrainz.json"), b"{}").unwrap();
+        let names = TrackNames {
+            title: Some("Golden".into()),
+            ..TrackNames::default()
+        };
+        let saved = layout
+            .place(
+                stage,
+                root.path(),
+                &["track.flac".into(), "track.musicbrainz.json".into()],
+                names,
+            )
+            .unwrap();
+        assert_eq!(Path::new(&saved[0]).file_name().unwrap(), "Golden.flac");
+        assert_eq!(Path::new(&saved[1]).file_name().unwrap(), "Golden.musicbrainz.json");
+
+        let stage2 = layout.staging(root.path()).unwrap().unwrap();
+        fs::write(stage2.path().join("track.flac"), b"fLaC").unwrap();
+        fs::write(stage2.path().join("evil.hta"), b"<script>").unwrap();
+        let err = layout
+            .place(
+                stage2,
+                root.path(),
+                &["track.flac".into(), "evil.hta".into()],
+                TrackNames::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains("unsupported file type"), "{err}");
     }
 }

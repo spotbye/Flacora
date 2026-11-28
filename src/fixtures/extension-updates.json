@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "extensions": {
+    "amazon-web": {
+      "version": "1.0.2"
+    },
+    "apple-web": {
+      "version": "1.0.1"
+    },
+    "betterlyrics": {
+      "version": "1.0.1"
+    },
+    "cyan-dl": {
+      "version": "1.0.2"
+    },
+    "deezer-web": {
+      "version": "1.0.2"
+    },
+    "doubledouble": {
+      "version": "1.0.2"
+    },
+    "flacdownloader": {
+      "version": "1.0.2"
+    },
+    "lrc-red": {
+      "version": "1.0.1"
+    },
+    "lrclib": {
+      "version": "1.0.1"
+    },
+    "lucida": {
+      "version": "1.0.3"
+    },
+    "lyricsplus": {
+      "version": "1.0.1"
+    },
+    "monochrome": {
+      "version": "1.0.2"
+    },
+    "musicbrainz": {
+      "version": "1.0.1"
+    },
+    "musixmatch": {
+      "version": "1.0.1"
+    },
+    "odesli": {
+      "version": "1.0.2"
+    },
+    "odskyler": {
+      "version": "1.0.2"
+    },
+    "qobuz-web": {
+      "version": "1.0.2"
+    },
+    "spotify-web": {
+      "version": "1.0.2"
+    },
+    "squigly": {
+      "version": "1.0.1"
+    },
+    "tidal-web": {
+      "version": "1.0.2"
+    },
+    "ytmusic-web": {
+      "version": "1.0.1"
+    }
+  }
+}

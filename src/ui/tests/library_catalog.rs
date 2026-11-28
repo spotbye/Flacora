@@ -2,6 +2,30 @@ use super::*;
 use crate::{fixtures, jobs::Status};
 
 #[test]
+fn catalog_header_artwork_preserves_geometry_and_selection_when_resized() {
+    let mut rt = runtime(|s| {
+        fixtures::catalog_results(s);
+        s.catalog.result.as_mut().unwrap().artwork = Some("https://example.com/catalog-cover.png".into());
+    });
+    for size in [crate::MIN_WINDOW_SIZE, (1280.0, 720.0), (2560.0, 1440.0)] {
+        rt.set_viewport(size, 1.0);
+        rt.frame(0.0);
+        rt.frame(0.6);
+        let (cover, _) = rt.presented("catalog-cover").expect("catalog header artwork");
+        let (page, _) = rt.presented("catalog-result-page").unwrap();
+        let (select, _) = rt.presented("catalog-select-all").unwrap();
+        assert_eq!((cover[2], cover[3]), (64.0, 64.0));
+        assert!(cover[0] >= page[0] && cover[0] + cover[2] <= page[0] + page[2]);
+        assert!(select[0] > cover[0] + cover[2], "selection stays beside the artwork");
+    }
+    tap(&mut rt, "catalog-select-all");
+    assert!(!rt.state.catalog.selected.is_empty());
+    tap(&mut rt, "catalog-use");
+    assert_eq!(rt.state.page, crate::app::Page::Downloads);
+    assert!(!rt.state.url.text.is_empty());
+}
+
+#[test]
 fn the_library_shows_its_recorded_source_and_leaves_older_links_generic() {
     let mut rt = runtime(|s| {
         fixtures::library_sources(s);
@@ -491,5 +515,84 @@ fn a_resolved_link_offers_the_services_it_was_found_on() {
     tap(&mut rt, &format!("choose-{id}-1"));
     let job = &rt.state.jobs[0];
     assert_eq!((job.status.clone(), job.service.map(|s| s.key)), (Status::Queued, Some("deezer")));
+}
+
+#[test]
+fn library_inspector_missing_actions_and_catalog_in_library_badge_work() {
+    let mut rt = runtime(|s| {
+        fixtures::library(s);
+        s.history[0].files = vec!["C:/Music/Present.flac".into()];
+        s.history[1].files = vec!["C:/Music/Missing.flac".into()];
+        s.library_files.insert("C:/Music/Present.flac".into(), crate::library::SidecarInfo {
+            exists: true,
+            sidecars: Vec::new(),
+        });
+        s.library_files.insert("C:/Music/Missing.flac".into(), crate::library::SidecarInfo {
+            exists: false,
+            sidecars: Vec::new(),
+        });
+    });
+    assert!(rt.find("inspect-entry-0").is_some());
+    tap(&mut rt, "inspect-entry-0");
+    assert!(rt.find("track-inspector-0").is_some());
+    assert!(rt.find("redownload-entry-1").is_some());
+    assert!(rt.find("remove-missing").is_some());
+    tap(&mut rt, "remove-missing");
+    assert_eq!(rt.state.history.len(), 3);
+    assert!(rt.state.undo.is_some());
+
+    let mut cat = runtime(|s| {
+        fixtures::catalog_results(s);
+        s.history[0].url = "https://www.deezer.com/track/3412534581".into();
+    });
+    assert!(cat.find("catalog-in-library-0").is_some());
+    assert!(cat.find("catalog-quick-0").is_some());
+    tap(&mut cat, "catalog-quick-0");
+    assert_eq!(cat.state.page, Page::Catalog, "quick queue keeps user in Catalog");
+    assert_eq!(cat.state.jobs.len(), 1);
+    assert_eq!(cat.state.jobs[0].url, "https://www.deezer.com/track/3412534581");
+}
+
+#[test]
+fn library_batch_selection_status_filters_and_export_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(fixtures::library_batch);
+    assert_eq!(rt.state.library_selected.len(), 2);
+    assert!(rt.find("library-batch-bar").is_some());
+    assert!(rt.find("library-status-lyrics").is_some());
+    assert!(rt.find("library-status-missing").is_some());
+
+    // Filter to Has Lyrics shows only the track with an .lrc sidecar.
+    tap(&mut rt, "library-status-lyrics");
+    assert_eq!(rt.state.filtered_history().len(), 1);
+    tap(&mut rt, "library-status-missing");
+    assert_eq!(rt.state.filtered_history().len(), 1);
+    tap(&mut rt, "library-status-all");
+    assert_eq!(rt.state.filtered_history().len(), 4);
+
+    // Export saves selected tracks via the Save dialog.
+    let export_path = dir.path().join("selected.csv");
+    tap(&mut rt, "library-export");
+    assert_eq!(rt.file_dialog().unwrap().0, rune::FileDialogKind::Save);
+    rt.resolve_file_dialog(Some(export_path.clone())).unwrap();
+    rt.frame(1.0 / 60.0);
+    assert!(export_path.is_file());
+    assert!(rt.state.info.as_ref().is_some_and(|n| n.message.contains("Exported 2 tracks")));
+
+    // Batch lookup queues all selected non-missing FLACs and switches to Downloads.
+    tap(&mut rt, "library-batch-lookup");
+    assert!(rt.find("batch-lookup-lrclib").is_some());
+    tap(&mut rt, "batch-lookup-lrclib");
+    assert_eq!(rt.state.page, Page::Downloads);
+    assert_eq!(rt.state.jobs.len(), 2);
+    assert!(!rt.state.library_select_mode);
+
+    // Batch remove supports Undo.
+    let mut rt2 = runtime(fixtures::library_batch);
+    tap(&mut rt2, "library-batch-remove");
+    assert_eq!(rt2.state.history.len(), 2);
+    assert!(rt2.state.undo.is_some());
+    rt2.state.undo_last();
+    assert_eq!(rt2.state.history.len(), 4);
 }
 

@@ -1,7 +1,7 @@
 //! Theme assets from astryx-rune 8102215, based on Astryx a8001d84.
 
-use crate::store::ThemePreset;
-use rune::{Color, Family, Shadow, Theme};
+use super::super::ThemePreset;
+use rune::{Color, Family, Theme};
 use rune_kit::{Kit, Radius, StateColors, Type};
 
 pub const FONTS: &[&[u8]] = &[
@@ -75,7 +75,8 @@ pub(super) fn set_body_family(ty: &mut Type, family: Family) {
     }
 }
 
-pub(super) fn apply(tokens: &Theme, kit: &mut Kit) {
+pub(super) fn apply(tokens: &Theme, kit: &mut Kit, dark: bool) {
+    let alpha = super::tokens::opacity(dark);
     let color = |name| tokens.color(name);
     let c = &mut kit.c;
     c.page = color("backgroundBody");
@@ -118,6 +119,9 @@ pub(super) fn apply(tokens: &Theme, kit: &mut Kit) {
     c.border_active = c.border_focus;
     c.hover = color("overlayHover");
     c.pressed = color("overlayPressed");
+    c.submit_hover = c.submit_fg.alpha(alpha.submit_hover);
+    c.contrast_hover = c.submit_hover;
+    c.contrast_pressed = c.submit_fg.alpha(alpha.contrast_pressed);
     c.scrim = color("overlay");
     c.surface_base = c.border_strong;
     c.surface_weak = c.layer_01;
@@ -150,12 +154,7 @@ pub(super) fn apply(tokens: &Theme, kit: &mut Kit) {
     c.warning = status("Warning");
     c.danger = status("Error");
 
-    kit.elevation = std::mem::take(&mut kit.elevation).with_input(vec![Shadow {
-        spread: 1.0,
-        color: c.border_strong,
-        inset: true,
-        ..Shadow::default()
-    }]);
+    super::metrics::input_elevation(kit);
     let inner = tokens.num("radius.inner");
     let element = tokens.num("radius.element");
     kit.radius = Radius {
@@ -169,11 +168,11 @@ pub(super) fn apply(tokens: &Theme, kit: &mut Kit) {
 
 // Flacora uses the same status ink on plain surfaces and within status panels.
 fn status_background(surface: Color, muted: Color, ink: Color) -> Color {
-    let background = surface.mix(muted, muted.a).alpha(1.0);
+    let background = surface.mix(muted, muted.a).alpha(super::tokens::OPAQUE);
     let (bg, fg) = (background.luminance() + 0.05, ink.luminance() + 0.05);
     if bg.max(fg) / bg.min(fg) >= 4.5 {
         background
     } else {
-        surface.mix(ink, 0.06)
+        surface.mix(ink, super::tokens::STATUS_FALLBACK_TINT_ALPHA)
     }
 }

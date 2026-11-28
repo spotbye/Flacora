@@ -7,7 +7,17 @@ pub fn is_collection(url: &Url) -> bool {
     let Some(first) = segments.next() else { return false };
 
     if host == "open.spotify.com" {
-        let kind = if first.starts_with("intl-") || first == "embed" { segments.next() } else { Some(first) };
+        let mut kind = Some(first);
+        while let Some(part) = kind {
+            if part.starts_with("intl-") || part == "embed" {
+                kind = segments.next();
+            } else if part == "user" {
+                let _ = segments.next();
+                kind = segments.next();
+            } else {
+                break;
+            }
+        }
         collection_kind(kind)
     } else if host_is(host, "tidal.com") {
         collection_kind(if first == "browse" { segments.next() } else { Some(first) })
@@ -18,9 +28,10 @@ pub fn is_collection(url: &Url) -> bool {
             Some("album") => !url.query_pairs().any(|(key, id)| key == "i" && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())),
             kind => collection_kind(kind),
         }
-    } else if matches!(host, "music.amazon.com" | "music.amazon.co.uk" | "music.amazon.de" | "music.amazon.co.jp") {
+    } else if crate::services::AMAZON_HOSTS.contains(&host) {
         match first {
             "album" | "albums" => amazon_track_id(url).is_none(),
+            "user-playlists" => true,
             _ => collection_kind(Some(first)),
         }
     } else if host_is(host, "youtube.com") {
@@ -57,10 +68,14 @@ mod tests {
         for link in [
             "https://open.spotify.com/album/7aJuG4TFXa2hmE4z1yxc3n",
             "https://open.spotify.com/intl-id/playlist/37i9dQZEVXbNG2KDcFcKOF",
+            "https://open.spotify.com/intl-en/embed/album/7aJuG4TFXa2hmE4z1yxc3n",
+            "https://open.spotify.com/user/spotify/playlist/37i9dQZEVXbNG2KDcFcKOF",
             "https://open.spotify.com/artist/06HL4z0CvFAxyc27GXpf02",
             "https://tidal.com/browse/album/441821356",
             "https://www.deezer.com/en/artist/330311461",
             "https://music.amazon.com/albums/B0FD256Q8D?trackAsin=bad",
+            "https://music.amazon.fr/albums/B0FD256Q8D",
+            "https://music.amazon.com.au/user-playlists/example",
             "https://music.apple.com/us/album/golden/1820264137",
             "https://music.youtube.com/playlist?list=OLAK5uy_example",
             "https://a.bandcamp.com/album/example",

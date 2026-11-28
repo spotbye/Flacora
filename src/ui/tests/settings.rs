@@ -422,6 +422,35 @@ fn queue_pause_copy_failed_batch_summary_and_duplicate_hint() {
     rt.frame(0.0);
     assert!(rt.find("batch-summary").is_some());
     assert!(rt.find("duplicate-hint").is_some());
+
+    // Queue status filter chips narrow visible jobs, and copy-log works.
+    assert!(rt.find("queue-filter-failed").is_some());
+    tap(&mut rt, "queue-filter-failed");
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert_eq!(rt.state.queue_filter, crate::app::QueueFilter::Failed);
+    assert!(rt.find("job-5").is_some());
+    assert!(rt.find("job-1").is_none());
+    assert!(rt.find("copy-log-5").is_some());
+    tap(&mut rt, "copy-log-5");
+    assert!(rt.state.info.as_ref().is_some_and(|n| n.message.contains("Copied job log")));
+    tap(&mut rt, "queue-filter-all");
+    assert!(rt.find("job-1").is_some());
+}
+
+#[test]
+fn settings_concurrency_and_cover_cache_controls_update_state() {
+    let mut rt = runtime_at(fixtures::settings, (1280.0, 960.0));
+    assert_eq!(rt.state.settings.max_concurrent_jobs, 1);
+    rt.wheel(760.0, 520.0, -2000.0);
+    rt.frame(1.0 / 60.0);
+    tap(&mut rt, "concurrent-jobs/segment2");
+    assert_eq!(rt.state.settings.max_concurrent_jobs, 3);
+
+    assert!(rt.find("clear-cover-cache").is_some());
+    tap(&mut rt, "clear-cover-cache");
+    assert!(rt.state.info.as_ref().is_some_and(|n| n.message.contains("cover artwork")));
 }
 
 #[test]
@@ -431,6 +460,38 @@ fn fixture_manifests_have_unique_extension_ids() {
         .map(|json| crate::extensions::parse_manifest(&json.to_string()).unwrap().id)
         .collect();
     assert_eq!(ids.len(), fixtures::MANIFESTS.len());
+}
+
+#[test]
+fn opacity_roles_follow_the_palette_without_moving_the_drop_target() {
+    for preset in ThemePreset::ALL {
+        for dark in [false, true] {
+            let mut state = App::default();
+            fixtures::extensions_empty(&mut state);
+            state.settings.theme_preset = preset;
+            state.settings.theme = if dark { crate::store::Theme::Dark } else { crate::store::Theme::Light };
+            let k = theme::kit(preset, dark);
+            let mut rt = Runtime::new(state, view, (1080.0, 820.0), rune::Env { system_dark: dark, scale: 1.0 });
+            rt.frame(0.0);
+            let bounds = rt.presented("drop-zone").unwrap().0;
+            let fill = |rt: &Runtime<App>| rt.elements().into_iter()
+                .find(|el| el.key.as_deref() == Some("drop-zone")).unwrap().fill;
+            assert_eq!(fill(&rt), k.c.bg_base);
+
+            rt.state.drop_over = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_eq!(fill(&rt), k.c.layer_04.alpha(0.35), "{preset:?}, dark={dark}");
+            assert_eq!(rt.presented("drop-zone").unwrap().0, bounds);
+            assert!(rt.find("drop-overlay").is_none(), "empty target stays unobscured");
+
+            rt.state.drop_over = false;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_eq!(fill(&rt), k.c.bg_base);
+            assert_eq!(rt.presented("drop-zone").unwrap().0, bounds);
+        }
+    }
 }
 
 #[test]
@@ -475,4 +536,84 @@ fn custom_pickers_and_selectable_cards_expose_astryx_accessibility_and_target_si
     let library = runtime(fixtures::library);
     let ([_, _, _, filter_h], _) = library.presented("library-filter-all").unwrap();
     assert_eq!(filter_h, 28.0);
+}
+
+#[test]
+fn astryx_metrics_preserve_control_geometry_across_presets_and_modes() {
+    for preset in ThemePreset::ALL {
+        for dark in [false, true] {
+            let scene = |setup: fn(&mut App)| {
+                let mut state = App::default();
+                setup(&mut state);
+                state.settings.theme_preset = preset;
+                state.settings.theme = if dark { crate::store::Theme::Dark } else { crate::store::Theme::Light };
+                let mut rt = Runtime::new(state, view, (1280.0, 820.0), rune::Env { system_dark: dark, scale: 1.0 });
+                rt.frame(0.0);
+                rt
+            };
+            let height = |rt: &Runtime<App>, key: &str, expected: f32| {
+                let ([_, _, _, actual], _) = rt.presented(key).unwrap_or_else(|| panic!("{preset:?}, dark={dark}: {key}"));
+                assert_eq!(actual, expected, "{preset:?}, dark={dark}: {key}");
+            };
+
+            let queue = scene(fixtures::queue);
+            height(&queue, "url", 36.0);
+            height(&queue, "download", 36.0);
+            height(&queue, "cancel-all", 32.0);
+            height(&queue, "toggle-pause", 28.0);
+            height(&queue, "nav-downloads", 36.0);
+            let ([_, _, logo_width, logo_height], _) = queue.presented("logo").unwrap();
+            assert_eq!((logo_width, logo_height), (32.0, 32.0));
+            let ([content_x, _, _, _], _) = queue.presented("content").unwrap();
+            assert_eq!(content_x, 233.0, "232 px sidebar plus its divider");
+            let elements = queue.elements();
+            let track = elements.iter().find(|el| el.path.ends_with("/progress-1/track")).unwrap();
+            assert_eq!((track.target[3], track.radius), (8.0, 4.0));
+
+            let library = scene(fixtures::library);
+            height(&library, "search", 32.0);
+            height(&library, "clear-history", 32.0);
+            height(&library, "library-filter-all", 28.0);
+            height(&library, "play-entry-0", 28.0);
+            height(&library, "library-sort", 28.0);
+
+            let catalog = scene(fixtures::catalog_results);
+            height(&catalog, "catalog-input", 36.0);
+            height(&catalog, "catalog-submit", 36.0);
+            height(&catalog, "catalog-home", 36.0);
+            let ([_, _, art_width, art_height], _) = catalog.presented("catalog-artwork-0").unwrap();
+            assert_eq!((art_width, art_height), (44.0, 44.0));
+
+            let settings = scene(fixtures::settings);
+            height(&settings, "theme-preset-neutral", 30.0);
+            height(&settings, "default-tidal/segment0", 28.0);
+            height(&settings, "default-tidal-track", 36.0);
+            height(&settings, "project-spotbye", 30.0);
+
+            let mut tagging = scene(fixtures::auto_tag_available_settings);
+            let switch_shape = |rt: &Runtime<App>| {
+                let elements = rt.elements();
+                let track = elements.iter().find(|el| el.path.ends_with("/auto-tag/track")).unwrap();
+                let thumb = elements.iter().find(|el| el.path.ends_with("/auto-tag/track/thumb")).unwrap();
+                assert_eq!((track.target[2], track.target[3], track.radius), (40.0, 24.0, 12.0));
+                (thumb.target[2], thumb.target[3], thumb.target[0] - track.target[0], thumb.target[1] - track.target[1])
+            };
+            assert_eq!(switch_shape(&tagging), (16.0, 16.0, 4.0, 4.0));
+            tap(&mut tagging, "auto-tag");
+            assert!(tagging.state.settings.auto_tag);
+            assert_eq!(switch_shape(&tagging), (20.0, 20.0, 18.0, 2.0));
+
+            let dialog = scene(fixtures::queue_cancel_confirmation);
+            let elements = dialog.elements();
+            let panel = elements.iter().find(|el| el.key.as_deref() == Some("cancel-all-dialog")).unwrap();
+            let title = elements.iter().find(|el| el.text.as_deref() == Some("Cancel all jobs?")).unwrap();
+            assert_eq!(panel.target[2], 416.0);
+            assert_eq!(title.target[0] - panel.target[0], 16.0);
+
+            let mut choose = scene(fixtures::choose);
+            height(&choose, "choose-1-0", 28.0);
+            tap(&mut choose, "choose-1-0");
+            assert_ne!(choose.state.jobs[0].status, crate::jobs::Status::Choosing);
+        }
+    }
 }

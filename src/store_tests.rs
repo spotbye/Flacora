@@ -113,6 +113,46 @@ fn web_package_replaces_its_legacy_metadata_install_only_when_idle() {
 }
 
 #[test]
+fn universal_packages_install_and_select_the_current_platform_executable() {
+    let (_guard, paths) = temp_root("universal");
+    let platforms = ["windows-x64", "linux-x64", "linux-arm64", "macos-x64", "macos-arm64"];
+    let mut manifest = crate::fixtures::manifest_json("odskyler").clone();
+    let executables: serde_json::Map<String, serde_json::Value> = platforms.iter().map(|platform| {
+        let name = if *platform == "windows-x64" { "odskyler.exe" } else { "odskyler" };
+        ((*platform).to_owned(), format!("bin/{platform}/{name}").into())
+    }).collect();
+    manifest["executable"] = executables.clone().into();
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive.start_file("extension.json", zip::write::SimpleFileOptions::default()).unwrap();
+    archive.write_all(manifest.to_string().as_bytes()).unwrap();
+    for platform in platforms {
+        archive.start_file(executables[platform].as_str().unwrap(), zip::write::SimpleFileOptions::default().unix_permissions(0o755)).unwrap();
+        archive.write_all(platform.as_bytes()).unwrap();
+    }
+    let mut payload = archive.finish().unwrap().into_inner();
+    let nonce = [0; 12];
+    Aes256Gcm::new(FEXT_KEY.into()).encrypt_in_place(&Nonce::from(nonce), FEXT_HEADER, &mut payload).unwrap();
+    let mut envelope = FEXT_HEADER.to_vec();
+    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(&payload);
+    let package = paths.root.join("odskyler-1.0.1.fext");
+    fs::write(&package, envelope).unwrap();
+    let installed = install_file(&paths, &package, |_| true).unwrap();
+    let platform = crate::extensions::platform();
+    assert_eq!(fs::read(installed.executable().unwrap()).unwrap(), platform.as_bytes());
+    for relative in installed.manifest.executable.values() {
+        assert!(installed.dir.join(relative).is_file());
+    }
+    let reloaded = load_installed(&paths);
+    assert_eq!(reloaded[0].executable(), installed.executable());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(fs::metadata(installed.executable().unwrap()).unwrap().permissions().mode() & 0o111, 0);
+    }
+}
+
+#[test]
 fn a_package_file_installs_and_a_newer_one_replaces_it() {
     let (_guard, paths) = temp_root("install");
     let first = install_file(&paths, &package(&paths.root, "0.1.0", true), |_| true).unwrap();
@@ -245,4 +285,39 @@ fn packages_with_symlinks_or_excessive_size_are_rejected() {
     }
     let error = unpack_with_limits(&many_pkg, &paths.root.join("out2"), 3, 1024).unwrap_err();
     assert!(error.contains("too many files"), "{error}");
+
+    let reserved_pkg = paths.root.join("reserved.fext");
+    {
+        let mut zip = zip::ZipWriter::new(File::create(&reserved_pkg).unwrap());
+        zip.start_file("CON.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"x").unwrap();
+        zip.finish().unwrap();
+    }
+    let error = unpack_with_limits(&reserved_pkg, &paths.root.join("out3"), 10, 1024).unwrap_err();
+    assert!(error.contains("unsafe path"), "{error}");
+}
+
+#[test]
+fn settings_clamp_concurrency_and_ignore_empty_output() {
+    let (_guard, paths) = temp_root("concurrency");
+    fs::write(paths.settings(), r#"{"output":"   ","max_concurrent_jobs":99}"#).unwrap();
+    let settings = load_settings(&paths);
+    assert_eq!(settings.output, default_output());
+    assert_eq!(settings.max_concurrent_jobs, 4);
+
+    let stale = paths.extensions().join(".import-abandoned");
+    fs::create_dir_all(&stale).unwrap();
+    cleanup_stale_temps(&paths);
+    assert!(!stale.exists());
+}
+
+#[test]
+fn installed_browser_prefers_newest_version() {
+    let (_guard, paths) = temp_root("browser-order");
+    for version in ["140.0.1.0", "145.0.7632.159.7", "142.0.5.0"] {
+        let exe = paths.browser().join(format!("chromium-{version}")).join(CLOAKBROWSER_EXECUTABLE);
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(exe, b"bin").unwrap();
+    }
+    assert_eq!(installed_browser(&paths.browser()), Some("145.0.7632.159.7".into()));
 }
