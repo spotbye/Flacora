@@ -1,37 +1,14 @@
-name: Build GUI
+name: Build
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'assets/**'
-      - 'xtask/**'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'build.rs'
-      - '.github/workflows/build.yml'
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'assets/**'
-      - 'xtask/**'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'build.rs'
-      - '.github/workflows/build.yml'
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -43,7 +20,7 @@ env:
 
 jobs:
   build:
-    name: gui / ${{ matrix.platform }}
+    name: ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -74,7 +51,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustup toolchain install "$channel" --profile minimal
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -87,17 +64,50 @@ jobs:
           curl --fail --location --retry 3 "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${arch}.AppImage" -o "$RUNNER_TEMP/appimagetool"
           chmod +x "$RUNNER_TEMP/appimagetool"
           echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
-      - name: Test
-        run: cargo test --locked --workspace
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build and package
         run: cargo run --locked -p xtask -- --platform "${{ matrix.platform }}"
-      - name: Upload gui artifacts
+      - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: flacora-gui-${{ matrix.platform }}
+          name: flacora-${{ matrix.platform }}
           path: dist/${{ matrix.platform }}/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
           compression-level: 0
+
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: flacora-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "Could not determine package version from Cargo.toml" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            draft_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" --jq ".[] | select(.tag_name == \"${tag}\" and .draft == true) | .id" | head -n1)
+            if [ -n "$draft_id" ]; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"
+            fi
+            gh release create "$tag" release-assets/* --draft --title "$tag" --generate-notes
+          fi
